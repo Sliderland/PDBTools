@@ -13,11 +13,22 @@ PDBEntryBuilder <- R6Class(
         model_name = NULL,
         posterior = NULL,
         rp = NULL,
-        initialize = function(path, added_by = "Gerald Press") {
+        initialize = function(
+            path,
+            added_by = "Gerald Press",
+            auto_write = TRUE,
+            n_threads = 2,
+            detect_cores = TRUE,
+            n_cores = NULL
+        ) {
             require(rstan)
-            Sys.setenv(STAN_NUM_THREADS = 2)
-            rstan_options(auto_write = TRUE)
-            options(mc.cores = parallel::detectCores())
+            rstan_options(auto_write = auto_write)
+            if (detect_cores) {
+                options(mc.cores = parallel::detectCores())
+            } else if (!is.null(n_cores)) {
+                options(mc.cores = n_cores)
+            }
+            Sys.setenv(STAN_NUM_THREADS = n_threads)
             self$path <- normalizePath(path, mustWork = TRUE)
             self$adder <- added_by
             private$pdb <- posteriordb::pdb_local(path = self$path)
@@ -603,38 +614,48 @@ PDBEntryBuilder <- R6Class(
                 )
             }
             checks_made <- rpi$checks_made
+            if (is.null(rpi$diagnostics)) {
+                rpi$diagnostics <- self$get_diagnostics(rp)
+            }
             if (is.null(checks_made)) {
                 checks_made <- list()
             }
             #Collecting Diagnostic Information
-            named_vars <- rpi$diagnostics$diagnostic_information$names
+            # if (is.null(rpi$diagnostics)) {
+            #     named_vars <-
+            # }
+            # named_vars <- rpi$diagnostics$diagnostic_information$names
+
             # summ <- posterior::summarize_draws(rp)
             # summ <- summ[which(summ[, 1] == named_vars), ]
             # rhat <- summ$rhat
             # ess_bulk <- summ$ess_bulk
             # ess_tail <- summ$ess_tail
-
-            num_divergent <- rpi$diagnostics$divergent_transitions
+            if (is.null(rpi$diagnostics)) {
+                if (inherits(rp, "pdb_posterior_reference_draws")) {
+                    diagnostics <- posterior::as_draws_df(rstan)
+                }
+                num_divergent <- rpi$diagnostics$divergent_transitions
+            }
             if (sum(num_divergent) > 0) {
                 stop(
                     "There were divergent transitions during sampling.",
                     call. = FALSE
                 )
             }
-
-            if (!"ndraws_is_10k" %in% names(checks_made)) {
+            if (self$check_missing("ndraws_is_10k", checks_made)) {
                 ndraws <- rpi$diagnostics$ndraws
                 checks_made$ndraws_is_10k <- ndraws == 10000
             }
-            if (!"nchains_is_gte_4" %in% names(checks_made)) {
+            if (self$check_missing("nchains_is_gte_4", checks_made)) {
                 nchains <- rpi$diagnostics$nchains
                 checks_made$nchains_is_gte_4 <- nchains >= 4
             }
-            if (!"r_hat_below_1_01" %in% names(checks_made)) {
+            if (self$check_missing("r_hat_below_1_01", checks_made)) {
                 rhat <- rpi$diagnostics$r_hat
                 curr_len <- length(rhat)
-                rhat <- rhat |> na.omit()
-                if (curr_len != length(rhat)) {
+                rhat_narm <- rhat |> na.omit()
+                if (curr_len != length(rhat_narm)) {
                     message(
                         paste0(
                             "Some variables had undefined Rhat. ",
@@ -645,16 +666,18 @@ PDBEntryBuilder <- R6Class(
                         )
                     )
                 }
-                checks_made$r_hat_below_1_01 <- all(rhat < 1.01)
+                checks_made$r_hat_below_1_01 <- self$check_rhat(rp, rhat)
             }
 
-            if (!"efmi_above_0_2" %in% names(checks_made)) {
+            if (self$check_missing("efmi_above_0_2", checks_made)) {
                 efmi <- rpi$diagnostics$expected_fraction_of_missing_information
                 checks_made$efmi_above_0_2 <- !anyNA(efmi) &&
                     all(is.finite(efmi)) &&
                     all(efmi > 0.2)
             }
-            if (!"abs_mean_lag1_ac_below_0_05" %in% names(checks_made)) {
+            if (
+                self$check_missing("abs_mean_lag1_ac_below_0_05", checks_made)
+            ) {
                 if (is.null(rpi$diagnostics$mean_lag1_ac)) {
                     mean_lag1_ac <- self$compute_mean_lag1_ac(
                         posterior::as_draws_array(rp)
@@ -693,6 +716,15 @@ PDBEntryBuilder <- R6Class(
             approx_ess_sd <- sqrt(7) * sqrt(ndraws)
             bnds <- ndraws + 4 * c(approx_ess_sd, -approx_ess_sd)
             list(ess_bulk = bnds, ess_tail = bnds)
+        },
+        compute_ac = function(x) {
+            x <- posterior::as_draws_array(x)
+            var_names <- posterior::variables(x)
+            abs(sapply(var_names, function(name) {
+                posterior::autocorrelation(
+                    posterior::extract_variable(x, name)
+                )[2]
+            }))
         },
         compute_mean_lag1_ac = function(x) {
             checkmate::assert_class(x, "draws")
@@ -811,38 +843,95 @@ PDBEntryBuilder <- R6Class(
 
             mean_rho1
         },
-        # compute_mean_lag1_ac = function(x) {
-        #     checkmate::assert_class(x, "draws")
+        check_rhat = function(draws, rhat, threshold = 1.01) {
+            draws <- posterior::as_draws_array(draws)
 
-        #     x <- posterior::as_draws_array(x)
-        #     # dimensions: iterations × chains × variables
+            variable_names <- dimnames(draws)$variable
 
-        #     rho1_by_chain <- apply(x, c(2, 3), function(z) {
-        #         stats::acf(
-        #             z,
-        #             lag.max = 1,
-        #             plot = FALSE,
-        #             demean = TRUE
-        #         )$acf[2]
-        #     })
-        #     # dimensions: chains × variables
-        #     mean_rho1 <- rho1_by_chain |> abs() |> colMeans()
-        #     curr_length <- length(mean_rho1)
-        #     mean_rho1 <- mean_rho1 |> na.omit()
-        #     if (curr_length != length(mean_rho1)) {
-        #         message(
-        #             paste0(
-        #                 "Some variables had undefined autocorrelation. ",
-        #                 "This may be expected for constant or structurally ",
-        #                 "constrained quantities. Verify that the corresponding",
-        #                 " draws are finite and legitimately constant."
-        #             )
-        #         )
-        #     }
-        #     names(mean_rho1) <- NULL
-        #     mean_rho1
-        #     # mean_rho1 <- abs(colMeans(rho1_by_chain))
-        # },
+            all_finite <- apply(
+                draws,
+                3,
+                function(z) all(is.finite(z))
+            )
+
+            if (any(!all_finite)) {
+                stop(
+                    "Non-finite posterior draws were found.",
+                    call. = FALSE
+                )
+            }
+
+            globally_constant <- apply(
+                draws,
+                3,
+                self$is_constant
+            )
+
+            constant_by_chain <- apply(
+                draws,
+                c(2, 3),
+                self$is_constant
+            )
+
+            partially_constant <- apply(
+                constant_by_chain,
+                2,
+                any
+            ) &
+                !globally_constant
+
+            if (any(partially_constant)) {
+                stop(
+                    paste0(
+                        "Variables were constant in only some chains, or ",
+                        "constant at different values across chains: ",
+                        paste(
+                            variable_names[partially_constant],
+                            collapse = ", "
+                        )
+                    ),
+                    call. = FALSE
+                )
+            }
+
+            # names(rhat) <- variable_names
+
+            variables_to_check <- !globally_constant
+
+            checked_rhat <- rhat[variables_to_check]
+
+            if (
+                anyNA(checked_rhat) ||
+                    any(!is.finite(checked_rhat))
+            ) {
+                stop(
+                    "R-hat was unexpectedly undefined for a nonconstant variable.",
+                    call. = FALSE
+                )
+            }
+
+            all(checked_rhat < threshold)
+        },
+        get_diagnostics = function(rp, to_keep = NULL) {
+            draws <- posterior::as_draws_array(rp)
+            if (!is.null(to_keep)) {
+                summ <- posterior::summarize_draws(draws)
+                # lag1ac <-
+            } else {
+                summ <- posterior::summarize_draws(draws)[to_keep, ]
+            }
+            summ <- posterior::summarize_draws(draws)[to_keep, ]
+            diagnostics <- list()
+            diagnostics$ndraws <- posterior::ndraws(draws)
+            diagnostics$nchains <- posterior::nchains(draws)
+            diagnostics$effective_sample_size_bulk <- summ$ess_bulk
+            diagnostics$effective_sample_size_tail <- summ$ess_tail
+            diagnostics$rhat <- summ$rhat
+            # diagnostics$divergent_transitions <-
+            diagnostics$mean_lag1_ac <- self$compute_mean_lag1_ac(
+                draws
+            )
+        },
         write_reference_draws = function(
             rp,
             recheck = TRUE,
@@ -1095,6 +1184,10 @@ PDBEntryBuilder <- R6Class(
                 "pdb_reference_posterior_draws"
             ))
             posteriordb::write_pdb()
+        },
+        check_missing = function(name, checks) {
+            value <- checks[[name]]
+            is.null(value) || length(value) != 1L
         },
         add_bibtex_file = function(path) {},
         set_data = function(d) {
