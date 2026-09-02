@@ -22,6 +22,7 @@ PDBEntryBuilder <- R6Class(
             n_cores = NULL
         ) {
             require(rstan)
+            require(posterior)
             rstan_options(auto_write = auto_write)
             if (detect_cores) {
                 options(mc.cores = parallel::detectCores())
@@ -583,6 +584,37 @@ PDBEntryBuilder <- R6Class(
             # Uses private$pdb
             invisible(rp)
         },
+        compute_reference_draws = function(
+            posterior_name,
+            sampling_args = NULL,
+            control_args = list(adapt_delta = 0.9),
+            comments = NULL,
+            added_by = self$adder,
+            compute_diagnostics,
+            auto_check = TRUE,
+            write = FALSE,
+            overwrite = FALSE
+        ) {
+            if (!auto_check && write) {
+                stop("Can't write draws without checking them first.")
+            }
+            posterior_objects <- self$get_posterior_modeldata(posterior_name)
+            sa <- list(
+                object = posterior_objects$stan_model,
+                data = posterior_objects$data
+            )
+            sa <- c(sa, sampling_args)
+            stan_fit <- do.call(rstan::sampling, sa)
+            stan_fit@model_name <- posterior_name
+            if (auto_check) {
+                stan_fit <- self$check_draws_from_stanfit(stan_fit)
+            }
+            #TO DO: Write_reference_draws_from_stan_fit
+            # if (write) {
+            #     self$write_reference_draws(stan_fit, overwrite = overwrite)
+            # }
+            stan_fit
+        },
         check_reference_draws = function(rp) {
             if (is.null(rp)) {
                 if (is.null(self$get_rp())) {
@@ -592,6 +624,25 @@ PDBEntryBuilder <- R6Class(
             } else {
                 posteriordb::check_reference_posterior_draws(x = rp)
             }
+        },
+        check_draws_from_stanfit = function(stan_fit) {
+            diagnostics <- self$get_diagnostics(stan_fit)
+            if (any(diagnostics$num_divergent > 0)) {
+                stop(
+                    "There were divergent transitions during sampling.",
+                    call. = FALSE
+                )
+            }
+
+            checks_made <- list()
+            checks_made$n_draws_is_10k <- diagnostics$ndraws == 10000
+            checks_made$nchains_is_gte_4 <- diagnostics$nchains > 4
+            # checks_made$ess_within_bounds <- diagnostics$effective_sample_size_bulk.
+            checks_made$r_hat_below_1_01 <- all(diagnostics$rhat < 1.01)
+            checks_made$efmi_above_0_2 <- all(diagnostics$efmi >= 0.2)
+            checks_made$abs_mean_lag1_ac_below_0_05 <- all(
+                diagnostics$mean_lag1_ac <= 0.05
+            )
         },
         check_draws = function(rp, write_mean_ac = FALSE) {
             rpi <- info(rp)
@@ -912,25 +963,44 @@ PDBEntryBuilder <- R6Class(
 
             all(checked_rhat < threshold)
         },
-        get_diagnostics = function(rp, to_keep = NULL) {
-            draws <- posterior::as_draws_array(rp)
+        get_diagnostics = function(stan_fit, to_keep = NULL) {
+            diag_summ <- rstan::get_sampler_params(stan_fit)
+            draws <- posterior::as_draws_df(stan_fit)
             if (!is.null(to_keep)) {
-                summ <- posterior::summarize_draws(draws)
-                # lag1ac <-
-            } else {
-                summ <- posterior::summarize_draws(draws)[to_keep, ]
+                to_keep <- self$get_posterior_dims(stan_fit@model_name)
+                draws <- posterior::subset_draws(draws, names(to_keep))
+                summ <- posterior::summarize_draws(stan_fit)[to_keep, ]
             }
-            summ <- posterior::summarize_draws(draws)[to_keep, ]
+            summ <- posterior::summarize_draws(draws)
             diagnostics <- list()
             diagnostics$ndraws <- posterior::ndraws(draws)
             diagnostics$nchains <- posterior::nchains(draws)
             diagnostics$effective_sample_size_bulk <- summ$ess_bulk
             diagnostics$effective_sample_size_tail <- summ$ess_tail
             diagnostics$rhat <- summ$rhat
-            # diagnostics$divergent_transitions <-
+            diagnostics$divergent_transitions <- sapply(diag_summ, function(x) {
+                sum(x[, "divergent__"])
+            })
+            diagnostics$efmi <- rstan::get_bfmi(stan_fit)
             diagnostics$mean_lag1_ac <- self$compute_mean_lag1_ac(
                 draws
             )
+            diagnostics
+        },
+        get_posterior_json = function(
+            posterior_name,
+            local_posterior_path = "/posterior_database/posteriors/"
+        ) {
+            posterior_name <- paste0(posterior_name, ".json")
+            posterior_path <- normalizePath(file.path(
+                self$get_pdb_path(),
+                local_posterior_path,
+                posterior_name
+            ))
+            jsonlite::read_json(posterior_path, simplifyVector = TRUE)
+        },
+        get_posterior_dims = function(po) {
+            self$get_posterior_json(po)$dimensions
         },
         write_reference_draws = function(
             rp,
@@ -1202,6 +1272,92 @@ PDBEntryBuilder <- R6Class(
         get_model_code = function() {
             self$model_code
         },
+        get_stan_model_code_path = function(
+            local_model_path = "/posterior_database/models/stan/"
+        ) {
+            normalizePath(file.path(self$get_pdb_path(), local_model_path))
+        },
+        get_data_path = function(
+            local_data_path = "/posterior_database/data/data/"
+        ) {
+            normalizePath(file.path(self$get_pdb_path(), local_data_path))
+        },
+        get_posterior_modeldata_files = function(posterior_name) {
+            data_model_name <- strsplit(posterior_name, split = "-")[[1]]
+            data_file_name <- paste0(data_model_name[1], ".json.zip")
+            model_file_name <- paste0(data_model_name[2], ".stan")
+            list(
+                "model_file" = normalizePath(file.path(
+                    self$get_stan_model_code_path(),
+                    model_file_name
+                )),
+                "data_file" = normalizePath(file.path(
+                    self$get_data_path(),
+                    data_file_name
+                ))
+            )
+        },
+        get_posterior_modeldata = function(posterior_name) {
+            md_file <- self$get_posterior_modeldata_files(posterior_name)
+            files_exist <- sapply(dm_paths, file.exists)
+            if (!all(files_exist)) {
+                stop(
+                    paste0(
+                        "The data or model file does not exist.",
+                        "Please ensure you specified the correct posterior name."
+                    ),
+                    call. = FALSE
+                )
+            }
+            posterior_model <- rstan::stan_model(
+                file = dm_paths$model_file,
+                model_name = posterior_name
+            )
+            posterior_model_code <- paste(
+                readLines(md_file$data_file),
+                collapse = "\n"
+            )
+            posterior_data <- unzip(self$copy_to_tempdir(
+                dm_paths$data_file,
+                unzip = TRUE,
+                return_data = TRUE
+            ))
+            list(
+                data = posterior_data,
+                stan_model = posterior_model,
+                model_code = posterior_model_code,
+                stan_file = md_file$model_file
+            )
+        },
+        # get_reference_posterior_info = function(
+        #     po,
+        #     local_posterior_info_path = "/posterior_database/reference_posteriors/draws/info/"
+        # ) {
+        #     rpi_path <- normalizePath(file.path(self$get_pdb_path(), )
+        # },
+        copy_to_tempdir = function(
+            file_path,
+            return_obj = TRUE,
+            overwrite = TRUE
+        ) {
+            if (grepl(".zip", file_path)) {
+                unzip <- TRUE
+            }
+            td <- normalizePath(base::tempdir())
+            copied_path <- normalizePath(file.path(td, basename(file_path)))
+            file.copy(
+                from = file_path,
+                to = td,
+                overwrite = overwrite
+            )
+            if (return_obj && unzip) {
+                jsonlite::read_json(unzip(copied_path), simplifyVector = TRUE)
+            } else if (return_obj) {
+                jsonlite::read_json(copied_path, simplifyVector = TRUE)
+            } else {
+                copied_path
+            }
+        },
         set_stan_file = function(sf) {
             self$stan_file <- sf
         },
@@ -1232,6 +1388,9 @@ PDBEntryBuilder <- R6Class(
         },
         get_pdb = function() {
             private$pdb
+        },
+        get_pdb_path = function() {
+            self$path
         }
     ),
 
