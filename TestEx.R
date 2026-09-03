@@ -4,7 +4,7 @@
 # and sampling arguments used in addStatPriorVAR.R. Sampling is deliberately
 # kept separate from registration so either stage can be rerun on its own.
 
-source("PDBEntryBuilder_Commit1.R")
+source("PDBEntryBuilder_v1.R")
 
 pdb_path <- "/Users/gerpr308/Documents/posteriordb"
 bayesian_ts_path <- paste0(
@@ -22,6 +22,44 @@ if (write_reference_files && !run_sampling) {
 }
 
 entry <- PDBEntryBuilder$new(pdb_path)
+
+heaps_reference_key <- "heaps2023stationary"
+heaps_reference <- paste(
+    "@article{heaps2023stationary,",
+    "  title = {Enforcing {Stationarity} through the {Prior} in {Vector} {Autoregressions}},",
+    "  author = {Heaps, Sarah E.},",
+    "  journal = {Journal of Computational and Graphical Statistics},",
+    "  year = {2023},",
+    "  volume = {32},",
+    "  number = {1},",
+    "  pages = {74--83},",
+    "  doi = {10.1080/10618600.2022.2079648},",
+    "  url = {https://doi.org/10.1080/10618600.2022.2079648},",
+    "  issn = {1061-8600},",
+    "  publisher = {Taylor \\& Francis},",
+    "  keywords = {Partial autocorrelation matrix, Stan, Unconstrained reparameterization, Vector autoregressive model}",
+    "}",
+    sep = "\n"
+)
+
+references_path <- file.path(
+    pdb_path,
+    "posterior_database",
+    "bibliography",
+    "references.bib"
+)
+
+reference_is_registered <- file.exists(references_path) &&
+    any(grepl(
+        paste0("{", heaps_reference_key, ","),
+        readLines(references_path, warn = FALSE),
+        fixed = TRUE
+    ))
+
+if (register_entries && !reference_is_registered) {
+    message("Adding bibliography entry: ", heaps_reference_key)
+    entry$add_bibtex_entry(heaps_reference)
+}
 
 # process_data() and its Stock-Watson preprocessing helpers are defined here.
 source(file.path(bayesian_ts_path, "HeapsStanPrograms", "read.R"))
@@ -161,6 +199,20 @@ sampling_args <- list(
     seed = 123,
     control = list(adapt_delta = 0.9)
 )
+
+# heaps3_statprior_var <- rstan::stan(
+#     file = file.path(heaps_program_path, "statpriorPDB.stan"),
+#     data = heaps3_data,
+#     chains = 10,
+#     iter = 30000,
+#     warmup = 10000,
+#     refresh = 10000,
+#     thin = 20,
+#     seed = 123,
+#     control = list(adapt_delta = 0.9)
+# )
+# rstan::check_divergences(heaps3_statprior_var)
+# diag_summ <- rstan::get_sampler_params(heaps3_statprior_var, inc_warmup = FALSE)
 
 reference_result <- NULL
 
