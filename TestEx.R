@@ -1,0 +1,315 @@
+# Integration workflow for PDBEntryBuilder_Commit1.R
+#
+# This uses the simple Gaussian earnings-on-height regression already present
+# in the local PosteriorDB checkout. It registers one copied model and two
+# copied data sets, producing two distinct test posteriors that share the same
+# Stan model.
+# Sampling and reference-file writes are opt-in so sourcing this file does not
+# immediately start a potentially expensive job.
+
+source("PDBEntryBuilder_Commit1.R")
+
+pdb_path <- "/Users/gerpr308/Documents/posteriordb"
+register_entries <- TRUE
+run_sampling <- TRUE
+write_reference_files <- TRUE
+overwrite_test_entries <- TRUE
+
+if (write_reference_files && !run_sampling) {
+    stop("`write_reference_files = TRUE` requires `run_sampling = TRUE`.")
+}
+
+entry <- PDBEntryBuilder$new(pdb_path)
+
+# Reuse a known simple Stan program, but register it under a test-only name.
+source_model_file <- file.path(
+    pdb_path,
+    "posterior_database",
+    "models",
+    "stan",
+    "earn_height.stan"
+)
+
+source_data_file <- file.path(
+    pdb_path,
+    "posterior_database",
+    "data",
+    "data",
+    "earnings.json.zip"
+)
+
+test_model_name <- "pdbtools_earn_height"
+test_data_names <- c(
+    "pdbtools_earnings_1",
+    "pdbtools_earnings_2"
+)
+test_posterior_names <- paste(test_data_names, test_model_name, sep = "-")
+
+earnings_data <- entry$copy_to_tempdir(source_data_file)
+
+make_data_info <- function(name, copy_number) {
+    list(
+        name = name,
+        keywords = c("pdbtools test", "linear regression"),
+        title = paste("PDBTools earnings test data", copy_number),
+        description = paste(
+            "A test-only copy of the earnings and height dataset used to",
+            "exercise the PDBEntryBuilder workflow."
+        ),
+        urls = paste0(
+            "https://github.com/stan-dev/example-models/",
+            "tree/master/ARM/Ch.4"
+        ),
+        references = "gelman2006data",
+        added_by = "Gerald Press",
+        added_date = Sys.Date()
+    )
+}
+
+test_model_info <- list(
+    name = test_model_name,
+    title = "PDBTools earnings-on-height test model",
+    framework = "stan",
+    description = paste(
+        "A test-only copy of a Gaussian linear regression of earnings on",
+        "height, used to exercise the PDBEntryBuilder workflow."
+    ),
+    keywords = c("pdbtools test", "linear regression"),
+    references = "gelman2006data",
+    urls = paste0(
+        "https://raw.githubusercontent.com/stan-dev/example-models/",
+        "master/ARM/Ch.4/earn_height.stan"
+    ),
+    prior = list(keywords = "stan_recommended_35dbfe6"),
+    added_by = "Gerald Press",
+    added_date = Sys.Date(),
+    licence = "BSD3"
+)
+
+if (register_entries) {
+    for (i in seq_along(test_data_names)) {
+        entry$add_data(
+            data = earnings_data,
+            info = make_data_info(test_data_names[[i]], i),
+            overwrite = overwrite_test_entries
+        )
+    }
+
+    entry$add_model_code(
+        stan_file = source_model_file,
+        info = test_model_info,
+        overwrite = overwrite_test_entries
+    )
+
+    for (data_name in test_data_names) {
+        posterior <- entry$prepare_posterior(
+            data_name = data_name,
+            model_name = test_model_name,
+            keywords = c("pdbtools test", "linear regression"),
+            references = "gelman2006data",
+            dimensions = list(beta = 2, sigma = 1)
+        )
+
+        entry$add_posterior(
+            spec = posterior,
+            overwrite = overwrite_test_entries,
+            dry_run = FALSE
+        )
+    }
+}
+
+# Ten chains with 1,000 retained post-warmup draws each gives the 10,000 total
+# draws required by the current custom checks. This Gaussian regression has
+# only three retained components and no hierarchical funnel. We still inspect
+# the checks before attempting to attach or write.
+sampling_args <- list(
+    chains = 10,
+    iter = 20000,
+    warmup = 10000,
+    thin = 10,
+    refresh = 2000,
+    seed = 4711,
+    control = list(adapt_delta = 0.8)
+)
+
+reference_results <- list()
+
+if (run_sampling) {
+    for (i in seq_along(test_posterior_names)) {
+        posterior_name <- test_posterior_names[[i]]
+        current_sampling_args <- sampling_args
+        current_sampling_args$seed <- sampling_args$seed + i - 1L
+        fit <- NULL
+
+        message(
+            "\nStarting posterior ",
+            i,
+            " of ",
+            length(test_posterior_names),
+            ": ",
+            posterior_name,
+            " (seed ",
+            current_sampling_args$seed,
+            ")"
+        )
+
+        result <- tryCatch(
+            {
+                fit <- entry$compute_reference_draws(
+                    posterior_name = posterior_name,
+                    sampling_args = current_sampling_args,
+                    comments = paste(
+                        "Integration test generated by",
+                        "PDBEntryBuilder_Commit1.R using the",
+                        "earnings-on-height Gaussian regression."
+                    ),
+                    auto_check = FALSE,
+                    write = FALSE,
+                    overwrite = overwrite_test_entries
+                )
+
+                fit_info <- entry$get_reference_info(fit)
+                divergences_by_chain <-
+                    fit_info$diagnostics$divergent_transitions
+                names(divergences_by_chain) <- paste0(
+                    "chain_",
+                    seq_along(divergences_by_chain)
+                )
+
+                divergences_valid <-
+                    length(divergences_by_chain) > 0L &&
+                    !anyNA(divergences_by_chain) &&
+                    all(is.finite(divergences_by_chain))
+                total_divergences <- if (divergences_valid) {
+                    sum(divergences_by_chain)
+                } else {
+                    NA_real_
+                }
+
+                message(
+                    posterior_name,
+                    " finished sampling with ",
+                    if (is.na(total_divergences)) {
+                        "invalid"
+                    } else {
+                        total_divergences
+                    },
+                    " divergent transitions."
+                )
+                message(
+                    "Divergences by chain: ",
+                    paste(
+                        names(divergences_by_chain),
+                        divergences_by_chain,
+                        sep = "=",
+                        collapse = ", "
+                    )
+                )
+
+                checks <- NULL
+                if (!divergences_valid || total_divergences > 0L) {
+                    failed_checks <- "divergent_transitions"
+                } else {
+                    checks <- entry$get_checks_from_stanfit(fit)
+                    failed_checks <- names(checks)[
+                        !vapply(checks, isTRUE, logical(1))
+                    ]
+                }
+
+                written <- FALSE
+                info_path <- NULL
+                draws_path <- NULL
+
+                if (length(failed_checks) == 0L) {
+                    fit <- entry$check_draws_from_stanfit(fit)
+
+                    if (write_reference_files) {
+                        info_path <- entry$write_rpi_from_stan_fit(
+                            fit,
+                            overwrite = overwrite_test_entries,
+                            verify = TRUE
+                        )
+                        draws_path <- entry$write_rpd_from_stan_fit(
+                            fit,
+                            overwrite = overwrite_test_entries,
+                            verify = TRUE
+                        )
+                        entry$verify_reference_files(fit)
+                        written <- TRUE
+                    }
+                } else {
+                    message(
+                        posterior_name,
+                        " was not written because these checks failed: ",
+                        paste(failed_checks, collapse = ", ")
+                    )
+                }
+
+                list(
+                    posterior_name = posterior_name,
+                    seed = current_sampling_args$seed,
+                    fit = fit,
+                    diagnostics = fit_info$diagnostics,
+                    divergences_by_chain = divergences_by_chain,
+                    total_divergences = total_divergences,
+                    checks = checks,
+                    failed_checks = failed_checks,
+                    written = written,
+                    info_path = info_path,
+                    draws_path = draws_path,
+                    error = NULL
+                )
+            },
+            error = function(e) {
+                message(
+                    posterior_name,
+                    " failed: ",
+                    conditionMessage(e)
+                )
+
+                list(
+                    posterior_name = posterior_name,
+                    seed = current_sampling_args$seed,
+                    fit = fit,
+                    diagnostics = NULL,
+                    divergences_by_chain = NULL,
+                    total_divergences = NA_real_,
+                    checks = NULL,
+                    failed_checks = NULL,
+                    written = FALSE,
+                    info_path = NULL,
+                    draws_path = NULL,
+                    error = conditionMessage(e)
+                )
+            }
+        )
+
+        reference_results[[posterior_name]] <- result
+    }
+
+    divergence_summary <- data.frame(
+        posterior = names(reference_results),
+        seed = vapply(reference_results, function(x) x$seed, numeric(1)),
+        divergences = vapply(
+            reference_results,
+            function(x) x$total_divergences,
+            numeric(1)
+        ),
+        written = vapply(reference_results, function(x) x$written, logical(1)),
+        error = vapply(
+            reference_results,
+            function(x) {
+                if (is.null(x$error)) NA_character_ else x$error
+            },
+            character(1)
+        ),
+        row.names = NULL
+    )
+
+    print(divergence_summary)
+}
+
+# Suggested progression:
+# 1. Source with the defaults to test registration only.
+# 2. Set run_sampling <- TRUE to calculate and inspect diagnostics/checks.
+# 3. Set write_reference_files <- TRUE only after the checks behave as intended.
