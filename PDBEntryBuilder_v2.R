@@ -1627,6 +1627,7 @@ PDBEntryBuilder <- R6::R6Class(
             summ <- posterior::summarize_draws(draws)
             diagnostic_names <- summ$variable
             diagnostics <- list(
+                diagnostic_information = list(names = diagnostic_names),
                 ndraws = posterior::ndraws(draws),
                 nchains = posterior::nchains(draws),
                 effective_sample_size_bulk = stats::setNames(
