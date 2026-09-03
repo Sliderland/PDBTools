@@ -586,11 +586,10 @@ PDBEntryBuilder <- R6Class(
         },
         compute_reference_draws = function(
             posterior_name,
-            sampling_args = NULL,
-            control_args = list(adapt_delta = 0.9),
+            sampling_args,
+            control_args = NULL, #must be a list
             comments = NULL,
             added_by = self$adder,
-            compute_diagnostics,
             auto_check = TRUE,
             write = FALSE,
             overwrite = FALSE
@@ -603,9 +602,30 @@ PDBEntryBuilder <- R6Class(
                 object = posterior_objects$stan_model,
                 data = posterior_objects$data
             )
-            sa <- c(sa, sampling_args)
+            if (is.null(control_args)) {
+                sa <- c(sa, sampling_args)
+                inference <- sampling_args
+            } else if (inherits(control_args, "list")) {
+                sa <- c(sa, sampling_args, control_args)
+                inference <- c(sampling_args, control_args)
+            } else {
+                stop("`control_args` must be null or a list.", call. = FALSE)
+            }
             stan_fit <- do.call(rstan::sampling, sa)
             stan_fit@model_name <- posterior_name
+            info(stan_fit) <- list(
+                name = posterior_name,
+                inference = list(
+                    method = "stan_sampling",
+                    method_arguments = inference
+                ),
+                diagnostics = self$get_diagnostics(stan_fit, to_keep = ),
+                checks_made = list(),
+                comments = comments,
+                added_by = added_by,
+                added_date = Sys.Date(),
+                versions = private$get_sampling_version_info()
+            )
             if (auto_check) {
                 stan_fit <- self$check_draws_from_stanfit(stan_fit)
             }
@@ -615,6 +635,68 @@ PDBEntryBuilder <- R6Class(
             # }
             stan_fit
         },
+        write_rpi_from_stan_fit = function(stan_fit) {
+            if (is.null(info(stan_fit))) {
+                stop(
+                    "`stan_fit` object must contain reference draw info. Call `add_rpi_from_stanfit()`",
+                    call. = FALSE
+                )
+            }
+            info <- info(stan_fit)
+            if (is.null(info$checks_made)) {
+                stop(
+                    "Draws must be checked before writing. Call `check_draws_from_stanfit()`",
+                    call. = FALSE
+                )
+            }
+            checks <- unlist(info$checks_made)
+            required_checks <- c(
+                "ndraws_is_10k",
+                "nchains_is_gte_4",
+                "r_hat_below_1_01",
+                "efmi_above_0_2",
+                "abs_mean_lag1_ac_below_0_05"
+            )
+            failed_checks <- required_checks[
+                !vapply(
+                    info$checks_made[required_checks],
+                    isTRUE,
+                    logical(1)
+                )
+            ]
+            if (length(failed_checks) > 0L) {
+                stop(
+                    paste0(
+                        "The following checks did not pass: ",
+                        paste(failed_checks, collapse = ", ")
+                    ),
+                    call. = FALSE
+                )
+            }
+            jsonlite::write_json(
+                info(stan_fit),
+                self$get_rpi_path(stan_fit@model_name)
+            )
+        },
+        write_rpd_from_stan_fit = function(stan_fit) {
+            if (!file.exists(self$get_rpi_path(stan_fit@model_name))) {
+                stop(
+                    "Make sure to write the reference posterior information to disk before writing the draws",
+                    call. = FALSE
+                )
+            }
+            to_keep <- self$get_posterior_dims(stan_fit@model_name)
+            draws <- posterior::subset_draws(
+                posterior::as_draws_array(stan_fit),
+                to_keep
+            )
+            rp_path <- self$get_rp_path(stan_fit@model_name)
+            jsonlite::write_json(draws, rp_path)
+            zip(rp_path)
+            file.remove(rp_path)
+            invisible(TRUE)
+        },
+        add_reference_draw_info_stanfit = function(stan_fit) {},
         check_reference_draws = function(rp) {
             if (is.null(rp)) {
                 if (is.null(self$get_rp())) {
@@ -625,24 +707,48 @@ PDBEntryBuilder <- R6Class(
                 posteriordb::check_reference_posterior_draws(x = rp)
             }
         },
-        check_draws_from_stanfit = function(stan_fit) {
-            diagnostics <- self$get_diagnostics(stan_fit)
-            if (any(diagnostics$num_divergent > 0)) {
+        check_draws_from_stanfit = function(stan_fit, attach = FALSE) {
+            if (is.null(info(stan_fit)$diagnostics)) {
+                diagnostics <- self$get_diagnostics(stan_fit)
+                info(stan_fit)$diagnostics <- self$get_diagnostics(stan_fit)
+            } else {
+                diagnostics <- info(stan_fit)$diagnostics
+            }
+            if (any(diagnostics$divergent_transitions > 0)) {
                 stop(
                     "There were divergent transitions during sampling.",
                     call. = FALSE
                 )
             }
+            ess_bounds <- self$generate_ess_bounds(diagnostics$ndraws)
 
-            checks_made <- list()
-            checks_made$n_draws_is_10k <- diagnostics$ndraws == 10000
-            checks_made$nchains_is_gte_4 <- diagnostics$nchains > 4
-            # checks_made$ess_within_bounds <- diagnostics$effective_sample_size_bulk.
-            checks_made$r_hat_below_1_01 <- all(diagnostics$rhat < 1.01)
-            checks_made$efmi_above_0_2 <- all(diagnostics$efmi >= 0.2)
-            checks_made$abs_mean_lag1_ac_below_0_05 <- all(
-                diagnostics$mean_lag1_ac <= 0.05
+            ess_within_bounds <-
+                within_bounds(
+                    diagnostics$effective_sample_size_bulk,
+                    ess_bounds$ess_bulk
+                ) &&
+                within_bounds(
+                    diagnostics$effective_sample_size_tail,
+                    ess_bounds$ess_tail
+                )
+            checks_made <- list(
+                n_draws_is_10k = diagnostics$ndraws == 10000,
+                nchains_is_gte_4 = diagnostics$nchains >= 4,
+                r_hat_below_1_01 = self$check_rhat(
+                    stan_fit,
+                    diagnostics$rhat
+                ),
+                ess_within_bounds = ess_within_bounds,
+                efmi_above_0_2 = all(diagnostics$efmi >= 0.2),
+                abs_mean_lag1_ac_below_0_05 = all(
+                    diagnostics$mean_lag1_ac <= 0.05
+                )
             )
+            if (attach) {
+                info(stan_fit)$checks_made <- checks_made
+            } else {
+                invisible(checks_made)
+            }
         },
         check_draws = function(rp, write_mean_ac = FALSE) {
             rpi <- info(rp)
@@ -767,6 +873,12 @@ PDBEntryBuilder <- R6Class(
             approx_ess_sd <- sqrt(7) * sqrt(ndraws)
             bnds <- ndraws + 4 * c(approx_ess_sd, -approx_ess_sd)
             list(ess_bulk = bnds, ess_tail = bnds)
+        },
+        is_within_bounds = function(x, bounds) {
+            length(x) > 0L &&
+                !anyNA(x) &&
+                all(is.finite(x)) &&
+                all(x >= min(bounds) & x <= max(bounds))
         },
         compute_ac = function(x) {
             x <- posterior::as_draws_array(x)
@@ -966,24 +1078,34 @@ PDBEntryBuilder <- R6Class(
         get_diagnostics = function(stan_fit, to_keep = NULL) {
             diag_summ <- rstan::get_sampler_params(stan_fit)
             draws <- posterior::as_draws_df(stan_fit)
-            if (!is.null(to_keep)) {
+            if (is.null(to_keep)) {
                 to_keep <- self$get_posterior_dims(stan_fit@model_name)
+            }
+            if (length(to_keep) != 0) {
                 draws <- posterior::subset_draws(draws, names(to_keep))
-                summ <- posterior::summarize_draws(stan_fit)[to_keep, ]
+            } else {
+                warning(paste0(
+                    "Including all variables in diagnostics. ",
+                    "This likely means that the posterior object ",
+                    "does not contain necessary model dimensions."
+                ))
             }
             summ <- posterior::summarize_draws(draws)
-            diagnostics <- list()
-            diagnostics$ndraws <- posterior::ndraws(draws)
-            diagnostics$nchains <- posterior::nchains(draws)
-            diagnostics$effective_sample_size_bulk <- summ$ess_bulk
-            diagnostics$effective_sample_size_tail <- summ$ess_tail
-            diagnostics$rhat <- summ$rhat
-            diagnostics$divergent_transitions <- sapply(diag_summ, function(x) {
-                sum(x[, "divergent__"])
-            })
-            diagnostics$efmi <- rstan::get_bfmi(stan_fit)
-            diagnostics$mean_lag1_ac <- self$compute_mean_lag1_ac(
-                draws
+            diagnostics <- list(
+                ndraws = posterior::ndraws(draws),
+                nchains = posterior::nchains(draws),
+                effective_sample_size_bulk = summ$ess_bulk,
+                effective_sample_size_tail = summ$ess_tail,
+                rhat = summ$rhat,
+                divergent_transitions = sapply(
+                    diag_summ,
+                    function(x) {
+                        sum(x[, "divergent__"])
+                    }
+                ),
+                efmi = rstan::get_bfmi(stan_fit),
+                mean_lag1_ac = self$compute_mean_lag1_ac(draws),
+                mean_lag1_ac_posterior = self$compute_ac(draws)
             )
             diagnostics
         },
@@ -1239,13 +1361,18 @@ PDBEntryBuilder <- R6Class(
             )
             self$refresh()
         },
-        write_reference_draw_info = function(info) {
+        write_reference_draw_info = function(
+            info,
+            overwrite = FALSE,
+            local_refdraw_info = "/posterior_database/reference_posteriors/draws/info/"
+        ) {
             if (inherits(info, "list")) {
                 info <- posteriordb::as.pdb_reference_posterior_info(info)
             }
             if (!inherits(info, "pdb_reference_posterior_info")) {
                 stop("Reference draw info needs to be posterior")
             }
+            posteriordb::write_pdb(info, self$get_pdb(), overwrite = overwrite)
         },
         write_draws = function(draws) {
             checkmate::assertTRUE(inherits(draws, "draws"))
@@ -1335,6 +1462,28 @@ PDBEntryBuilder <- R6Class(
         # ) {
         #     rpi_path <- normalizePath(file.path(self$get_pdb_path(), )
         # },
+        get_rpi_path = function(
+            rpi_name,
+            local_rpi_path = "/posterior_database/reference_posteriors/draws/info/"
+        ) {
+            rpi_name <- paste0(rpi_name, ".json")
+            normalizePath(file.path(
+                self$get_pdb_path(),
+                local_rpi_path,
+                rpi_name
+            ))
+        },
+        get_rp_path = function(
+            rp_name,
+            local_rp_path = "/posterior_database/reference_posteriors/draws/draws/"
+        ) {
+            rp_name <- paste0(rp_name, ".json")
+            normalizePath(file.path(
+                self$get_pdb_path(),
+                local_rp_path,
+                rp_name
+            ))
+        },
         copy_to_tempdir = function(
             file_path,
             return_obj = TRUE,
@@ -1396,10 +1545,35 @@ PDBEntryBuilder <- R6Class(
 
     private = list(
         pdb = NULL,
+        get_sampling_version_info = function() {
+            M <- file.path(
+                Sys.getenv("HOME"),
+                ".R",
+                ifelse(
+                    .Platform$OS.type == "windows",
+                    "Makevars.win",
+                    "Makevars"
+                )
+            )
+            Mfile <- if (file.exists(M)) {
+                paste(readLines(M), collapse = "\n")
+            } else {
+                "[Could not find Makevar file]"
+            }
+            list(
+                rstan_version = paste("rstan", utils::packageVersion("rstan")),
+                r_Makevars = paste(Mfile, collapse = "\n"),
+                r_version = R.version$version.string,
+                r_session = paste(
+                    utils::capture.output(print(utils::sessionInfo())),
+                    collapse = "\n"
+                )
+            )
+        },
         get_reference_path = function(
-            local_reference_path = "posterior_database/bibliography/references.bib"
+            local_bib_path = "posterior_database/bibliography/references.bib"
         ) {
-            file.path(self$path, local_reference_path)
+            file.path(self$path, local_bib_path)
         }
     )
 )
