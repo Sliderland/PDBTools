@@ -291,6 +291,7 @@ if (run_sampling) {
     }
     info_path <- NULL
     draws_path <- NULL
+    summary_paths <- NULL
 
     if (length(failed_required_checks) > 0L) {
         message(
@@ -312,6 +313,11 @@ if (run_sampling) {
                 overwrite = overwrite_test_entries,
                 verify = TRUE
             )
+            summary_paths <- entry$write_summary_statistics_from_stan_fit(
+                fit,
+                overwrite = overwrite_test_entries,
+                verify = TRUE
+            )
             entry$verify_reference_files(fit)
         }
     }
@@ -326,6 +332,7 @@ if (run_sampling) {
         failed_checks = failed_checks,
         failed_required_checks = failed_required_checks,
         info_path = info_path,
-        draws_path = draws_path
+        draws_path = draws_path,
+        summary_paths = summary_paths
     )
 }

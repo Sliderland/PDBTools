@@ -760,6 +760,7 @@ PDBEntryBuilder <- R6::R6Class(
                         written <- FALSE
                         info_path <- NULL
                         draws_path <- NULL
+                        summary_paths <- NULL
 
                         if (sample) {
                             if (
@@ -865,6 +866,11 @@ PDBEntryBuilder <- R6::R6Class(
                                         overwrite = entry_overwrite,
                                         verify = TRUE
                                     )
+                                    summary_paths <- self$write_summary_statistics_from_stan_fit(
+                                        fit,
+                                        overwrite = entry_overwrite,
+                                        verify = TRUE
+                                    )
                                     self$verify_reference_files(fit)
                                     written <- TRUE
                                 }
@@ -897,6 +903,7 @@ PDBEntryBuilder <- R6::R6Class(
                             written = written,
                             info_path = info_path,
                             draws_path = draws_path,
+                            summary_paths = summary_paths,
                             error = NULL
                         )
                     },
@@ -918,6 +925,7 @@ PDBEntryBuilder <- R6::R6Class(
                             written = FALSE,
                             info_path = NULL,
                             draws_path = NULL,
+                            summary_paths = NULL,
                             error = conditionMessage(e)
                         )
                     }
@@ -1039,6 +1047,11 @@ PDBEntryBuilder <- R6::R6Class(
             if (write) {
                 self$write_rpi_from_stan_fit(stan_fit, overwrite = overwrite)
                 self$write_rpd_from_stan_fit(
+                    stan_fit,
+                    overwrite = overwrite,
+                    verify = TRUE
+                )
+                self$write_summary_statistics_from_stan_fit(
                     stan_fit,
                     overwrite = overwrite,
                     verify = TRUE
@@ -1775,11 +1788,104 @@ PDBEntryBuilder <- R6::R6Class(
         # ) {
         #     rpi_path <- normalizePath(file.path(self$get_pdb_path(), )
         # },
+        compute_reference_summary_statistics = function(stan_fit) {
+            stan_info <- self$get_reference_info(stan_fit)
+            if (is.null(stan_info) || is.null(stan_info$checks_made)) {
+                stop("Draws must be checked before computing summaries.", call. = FALSE)
+            }
+            required_checks <- c(
+                "ndraws_is_10k", "nchains_is_gte_4", "r_hat_below_1_01",
+                "efmi_above_0_2", "abs_mean_lag1_ac_below_0_05"
+            )
+            failed_checks <- required_checks[
+                !vapply(stan_info$checks_made[required_checks], isTRUE, logical(1))
+            ]
+            if (length(failed_checks) > 0L) {
+                stop("Required checks failed: ", paste(failed_checks, collapse = ", "), call. = FALSE)
+            }
+            draws <- posterior::subset_draws(
+                posterior::as_draws_array(stan_fit),
+                variable = names(self$get_posterior_dims(stan_fit@model_name))
+            )
+            mean_summary <- posterior::summarize_draws(draws, "mean", "mcse_mean")
+            squared_draws <- draws
+            squared_draws[] <- squared_draws[]^2
+            squared_summary <- posterior::summarize_draws(
+                squared_draws, "mean", "mcse_mean"
+            )
+            list(
+                mean_value = list(
+                    names = as.character(mean_summary$variable),
+                    mean_value = as.numeric(mean_summary$mean),
+                    mcse_mean = as.numeric(mean_summary$mcse_mean)
+                ),
+                mean_squared_value = list(
+                    names = as.character(squared_summary$variable),
+                    mean_squared_value = as.numeric(squared_summary$mean),
+                    mcse_mean = as.numeric(squared_summary$mcse_mean)
+                )
+            )
+        },
+        get_summary_statistic_paths = function(posterior_name, type) {
+            supported <- c("mean_value", "mean_squared_value")
+            checkmate::assert_choice(type, supported)
+            root <- file.path(
+                self$get_pdb_path(), "posterior_database",
+                "reference_posteriors", "summary_statistics", type
+            )
+            list(
+                info = file.path(root, "info", paste0(posterior_name, ".info.json")),
+                value = file.path(root, type, paste0(posterior_name, ".json"))
+            )
+        },
+        write_summary_statistics_from_stan_fit = function(
+            stan_fit, overwrite = FALSE, verify = TRUE
+        ) {
+            checkmate::assert_flag(overwrite)
+            checkmate::assert_flag(verify)
+            summaries <- self$compute_reference_summary_statistics(stan_fit)
+            summary_info <- self$get_reference_info(stan_fit)
+            summary_info$versions$r_summary_statistic <- paste0(
+                "posterior R package, version ", utils::packageVersion("posterior")
+            )
+            paths <- lapply(names(summaries), function(type) {
+                self$get_summary_statistic_paths(stan_fit@model_name, type)
+            })
+            names(paths) <- names(summaries)
+            destinations <- unlist(paths, use.names = FALSE)
+            if (!overwrite && any(file.exists(destinations))) {
+                stop("One or more summary-statistic files already exist.", call. = FALSE)
+            }
+            write_one <- function(x, path) {
+                dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+                jsonlite::write_json(
+                    x, path, pretty = TRUE, auto_unbox = TRUE,
+                    null = "null", digits = NA
+                )
+            }
+            for (type in names(summaries)) {
+                write_one(summary_info, paths[[type]]$info)
+                write_one(summaries[[type]], paths[[type]]$value)
+                if (verify) {
+                    value <- jsonlite::read_json(paths[[type]]$value, simplifyVector = TRUE)
+                    info <- jsonlite::read_json(paths[[type]]$info, simplifyVector = TRUE)
+                    if (
+                        !identical(info$name, summary_info$name) ||
+                            !identical(value$names, summaries[[type]]$names) ||
+                            !isTRUE(all.equal(value[[type]], summaries[[type]][[type]], check.attributes = FALSE)) ||
+                            !isTRUE(all.equal(value$mcse_mean, summaries[[type]]$mcse_mean, check.attributes = FALSE))
+                    ) {
+                        stop("Summary verification failed for ", type, ".", call. = FALSE)
+                    }
+                }
+            }
+            invisible(paths)
+        },
         get_rpi_path = function(
             rpi_name,
-            local_rpi_path = "/posterior_database/reference_posteriors/draws/info/"
+            local_rpi_path = "/posterior_database/reference_posteriors/draws/info"
         ) {
-            rpi_name <- paste0(rpi_name, ".json")
+            rpi_name <- paste0(rpi_name, ".info.json")
             normalizePath(
                 file.path(
                     self$get_pdb_path(),
@@ -1791,7 +1897,7 @@ PDBEntryBuilder <- R6::R6Class(
         },
         get_rp_path = function(
             rp_name,
-            local_rp_path = "/posterior_database/reference_posteriors/draws/draws/"
+            local_rp_path = "/posterior_database/reference_posteriors/draws/draws"
         ) {
             rp_name <- paste0(rp_name, ".json.zip")
             normalizePath(
