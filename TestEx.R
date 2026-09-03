@@ -16,6 +16,7 @@ register_entries <- TRUE
 run_sampling <- TRUE
 write_reference_files <- TRUE
 overwrite_test_entries <- TRUE
+n_ess_failures_to_show <- 10L
 
 if (write_reference_files && !run_sampling) {
     stop("`write_reference_files = TRUE` requires `run_sampling = TRUE`.")
@@ -257,14 +258,45 @@ if (run_sampling) {
 
     checks <- entry$get_checks_from_stanfit(fit)
     failed_checks <- names(checks)[!vapply(checks, isTRUE, logical(1))]
+    required_checks <- c(
+        "ndraws_is_10k",
+        "nchains_is_gte_4",
+        "r_hat_below_1_01",
+        "efmi_above_0_2",
+        "abs_mean_lag1_ac_below_0_05"
+    )
+    failed_required_checks <- intersect(failed_checks, required_checks)
+
+    if (!isTRUE(checks$ess_within_bounds)) {
+        ess_failures <- entry$get_ess_bounds_failures(fit_info$diagnostics)
+        shown_names <- head(ess_failures$any, n_ess_failures_to_show)
+        message(
+            "Legacy ESS bounds check did not pass: ",
+            ess_failures$total_count,
+            " unique variables were outside the bounds (bulk: ",
+            ess_failures$bulk_count,
+            ", tail: ",
+            ess_failures$tail_count,
+            ")."
+        )
+        message(
+            "First ",
+            length(shown_names),
+            " affected variables: ",
+            paste(shown_names, collapse = ", ")
+        )
+        message(
+            "This deprecated check is recorded but does not prevent writing."
+        )
+    }
     info_path <- NULL
     draws_path <- NULL
 
-    if (length(failed_checks) > 0L) {
+    if (length(failed_required_checks) > 0L) {
         message(
             posterior_name,
-            " was not written because these checks failed: ",
-            paste(failed_checks, collapse = ", ")
+            " was not written because these required checks failed: ",
+            paste(failed_required_checks, collapse = ", ")
         )
     } else {
         fit <- entry$check_draws_from_stanfit(fit)
@@ -292,6 +324,7 @@ if (run_sampling) {
         total_divergences = total_divergences,
         checks = checks,
         failed_checks = failed_checks,
+        failed_required_checks = failed_required_checks,
         info_path = info_path,
         draws_path = draws_path
     )

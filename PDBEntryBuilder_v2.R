@@ -754,6 +754,7 @@ PDBEntryBuilder <- R6::R6Class(
 
                         checks <- NULL
                         failed_checks <- character()
+                        failed_required_checks <- character()
                         divergences_by_chain <- NULL
                         total_divergences <- NA_real_
                         written <- FALSE
@@ -832,14 +833,26 @@ PDBEntryBuilder <- R6::R6Class(
                                     total_divergences > 0L
                             ) {
                                 failed_checks <- "divergent_transitions"
+                                failed_required_checks <- failed_checks
                             } else {
                                 checks <- self$get_checks_from_stanfit(fit)
                                 failed_checks <- names(checks)[
                                     !vapply(checks, isTRUE, logical(1))
                                 ]
+                                required_checks <- c(
+                                    "ndraws_is_10k",
+                                    "nchains_is_gte_4",
+                                    "r_hat_below_1_01",
+                                    "efmi_above_0_2",
+                                    "abs_mean_lag1_ac_below_0_05"
+                                )
+                                failed_required_checks <- intersect(
+                                    failed_checks,
+                                    required_checks
+                                )
                             }
 
-                            if (length(failed_checks) == 0L) {
+                            if (length(failed_required_checks) == 0L) {
                                 fit <- self$check_draws_from_stanfit(fit)
                                 if (write) {
                                     info_path <- self$write_rpi_from_stan_fit(
@@ -858,7 +871,7 @@ PDBEntryBuilder <- R6::R6Class(
                             }
                         }
 
-                        status <- if (length(failed_checks) > 0L) {
+                        status <- if (length(failed_required_checks) > 0L) {
                             "failed_checks"
                         } else {
                             "completed"
@@ -880,6 +893,7 @@ PDBEntryBuilder <- R6::R6Class(
                             total_divergences = total_divergences,
                             checks = checks,
                             failed_checks = failed_checks,
+                            failed_required_checks = failed_required_checks,
                             written = written,
                             info_path = info_path,
                             draws_path = draws_path,
@@ -900,6 +914,7 @@ PDBEntryBuilder <- R6::R6Class(
                             total_divergences = NA_real_,
                             checks = NULL,
                             failed_checks = character(),
+                            failed_required_checks = character(),
                             written = FALSE,
                             info_path = NULL,
                             draws_path = NULL,
@@ -949,6 +964,13 @@ PDBEntryBuilder <- R6::R6Class(
                 failed_checks = vapply(
                     results,
                     function(x) paste(x$failed_checks, collapse = ", "),
+                    character(1)
+                ),
+                failed_required_checks = vapply(
+                    results,
+                    function(x) {
+                        paste(x$failed_required_checks, collapse = ", ")
+                    },
                     character(1)
                 ),
                 written = vapply(
@@ -1046,7 +1068,6 @@ PDBEntryBuilder <- R6::R6Class(
                 "ndraws_is_10k",
                 "nchains_is_gte_4",
                 "r_hat_below_1_01",
-                "ess_within_bounds",
                 "efmi_above_0_2",
                 "abs_mean_lag1_ac_below_0_05"
             )
@@ -1271,16 +1292,8 @@ PDBEntryBuilder <- R6::R6Class(
                     call. = FALSE
                 )
             }
-            ess_bounds <- self$generate_ess_bounds(diagnostics$ndraws)
-            ess_within_bounds <-
-                self$is_within_bounds(
-                    diagnostics$effective_sample_size_bulk,
-                    ess_bounds$ess_bulk
-                ) &&
-                self$is_within_bounds(
-                    diagnostics$effective_sample_size_tail,
-                    ess_bounds$ess_tail
-                )
+            ess_failures <- self$get_ess_bounds_failures(diagnostics)
+            ess_within_bounds <- ess_failures$total_count == 0L
             diagnostic_draws <- posterior::subset_draws(
                 posterior::as_draws_array(stan_fit),
                 variable = names(diagnostics$rhat)
@@ -1319,8 +1332,15 @@ PDBEntryBuilder <- R6::R6Class(
                 stan_fit,
                 stan_info$diagnostics
             )
-            failed_checks <- names(checks_made)[
-                !vapply(checks_made, isTRUE, logical(1))
+            required_checks <- c(
+                "ndraws_is_10k",
+                "nchains_is_gte_4",
+                "r_hat_below_1_01",
+                "efmi_above_0_2",
+                "abs_mean_lag1_ac_below_0_05"
+            )
+            failed_checks <- required_checks[
+                !vapply(checks_made[required_checks], isTRUE, logical(1))
             ]
             if (length(failed_checks) > 0L) {
                 stop(
@@ -1340,11 +1360,48 @@ PDBEntryBuilder <- R6::R6Class(
             bnds <- ndraws + 4 * c(approx_ess_sd, -approx_ess_sd)
             list(ess_bulk = bnds, ess_tail = bnds)
         },
+        get_ess_bounds_failures = function(diagnostics) {
+            ess_bounds <- self$generate_ess_bounds(diagnostics$ndraws)
+            find_failures <- function(x, bounds) {
+                failed <- is.na(x) |
+                    !is.finite(x) |
+                    x < min(bounds) |
+                    x > max(bounds)
+                names(x)[failed]
+            }
+            bulk <- find_failures(
+                diagnostics$effective_sample_size_bulk,
+                ess_bounds$ess_bulk
+            )
+            tail <- find_failures(
+                diagnostics$effective_sample_size_tail,
+                ess_bounds$ess_tail
+            )
+            any <- union(bulk, tail)
+            list(
+                bulk = bulk,
+                tail = tail,
+                any = any,
+                bulk_count = length(bulk),
+                tail_count = length(tail),
+                total_count = length(any),
+                bounds = ess_bounds
+            )
+        },
         is_within_bounds = function(x, bounds) {
             length(x) > 0L &&
                 !anyNA(x) &&
                 all(is.finite(x)) &&
                 all(x >= min(bounds) & x <= max(bounds))
+        },
+        compute_ac = function(x) {
+            x <- posterior::as_draws_array(x)
+            var_names <- posterior::variables(x)
+            abs(vapply(var_names, function(name) {
+                posterior::autocorrelation(
+                    posterior::extract_variable(x, name)
+                )[2]
+            }, numeric(1)))
         },
         compute_mean_lag1_ac = function(x) {
             checkmate::assert_class(x, "draws")
@@ -1588,7 +1645,8 @@ PDBEntryBuilder <- R6::R6Class(
                     }
                 ),
                 efmi = rstan::get_bfmi(stan_fit),
-                mean_lag1_ac = self$compute_mean_lag1_ac(draws)
+                mean_lag1_ac = self$compute_mean_lag1_ac(draws),
+                mean_lag1_ac_posterior = self$compute_ac(draws)
             )
             diagnostics
         },

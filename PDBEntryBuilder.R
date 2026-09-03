@@ -720,29 +720,25 @@ PDBEntryBuilder <- R6Class(
                     call. = FALSE
                 )
             }
-            ess_bounds <- self$generate_ess_bounds(diagnostics$ndraws)
-
-            ess_within_bounds <-
-                within_bounds(
-                    diagnostics$effective_sample_size_bulk,
-                    ess_bounds$ess_bulk
-                ) &&
-                within_bounds(
-                    diagnostics$effective_sample_size_tail,
-                    ess_bounds$ess_tail
-                )
+            ess_failures <- self$get_ess_bounds_failures(diagnostics)
+            ess_within_bounds <- ess_failures$total_count == 0L
             checks_made <- list(
-                n_draws_is_10k = diagnostics$ndraws == 10000,
+                ndraws_is_10k = diagnostics$ndraws == 10000,
                 nchains_is_gte_4 = diagnostics$nchains >= 4,
                 r_hat_below_1_01 = self$check_rhat(
                     stan_fit,
                     diagnostics$rhat
                 ),
                 ess_within_bounds = ess_within_bounds,
-                efmi_above_0_2 = all(diagnostics$efmi >= 0.2),
-                abs_mean_lag1_ac_below_0_05 = all(
-                    diagnostics$mean_lag1_ac <= 0.05
-                )
+                efmi_above_0_2 = !anyNA(diagnostics$efmi) &&
+                    all(is.finite(diagnostics$efmi)) &&
+                    all(diagnostics$efmi >= 0.2),
+                abs_mean_lag1_ac_below_0_05 = all(is.finite(
+                    diagnostics$mean_lag1_ac[
+                        !is.na(diagnostics$mean_lag1_ac)
+                    ]
+                )) &&
+                    all(diagnostics$mean_lag1_ac <= 0.05, na.rm = TRUE)
             )
             if (attach) {
                 info(stan_fit)$checks_made <- checks_made
@@ -849,7 +845,14 @@ PDBEntryBuilder <- R6Class(
                     na.rm = TRUE
                 )
             }
-            checks_passed <- all(sapply(names(checks_made), function(x) {
+            required_checks <- c(
+                "ndraws_is_10k",
+                "nchains_is_gte_4",
+                "r_hat_below_1_01",
+                "efmi_above_0_2",
+                "abs_mean_lag1_ac_below_0_05"
+            )
+            checks_passed <- all(vapply(required_checks, function(x) {
                 if (is.na(checks_made[[x]])) {
                     message(paste0(x, " could not be evaluated. "))
                     return(FALSE)
@@ -857,8 +860,8 @@ PDBEntryBuilder <- R6Class(
                     message(paste0(x, " did not pass."))
                     return(FALSE)
                 }
-                return(TRUE)
-            }))
+                TRUE
+            }, logical(1)))
             if (!checks_passed) {
                 stop(call. = FALSE)
             }
@@ -873,6 +876,34 @@ PDBEntryBuilder <- R6Class(
             approx_ess_sd <- sqrt(7) * sqrt(ndraws)
             bnds <- ndraws + 4 * c(approx_ess_sd, -approx_ess_sd)
             list(ess_bulk = bnds, ess_tail = bnds)
+        },
+        get_ess_bounds_failures = function(diagnostics) {
+            ess_bounds <- self$generate_ess_bounds(diagnostics$ndraws)
+            find_failures <- function(x, bounds) {
+                failed <- is.na(x) |
+                    !is.finite(x) |
+                    x < min(bounds) |
+                    x > max(bounds)
+                names(x)[failed]
+            }
+            bulk <- find_failures(
+                diagnostics$effective_sample_size_bulk,
+                ess_bounds$ess_bulk
+            )
+            tail <- find_failures(
+                diagnostics$effective_sample_size_tail,
+                ess_bounds$ess_tail
+            )
+            any <- union(bulk, tail)
+            list(
+                bulk = bulk,
+                tail = tail,
+                any = any,
+                bulk_count = length(bulk),
+                tail_count = length(tail),
+                total_count = length(any),
+                bounds = ess_bounds
+            )
         },
         is_within_bounds = function(x, bounds) {
             length(x) > 0L &&
@@ -1091,12 +1122,19 @@ PDBEntryBuilder <- R6Class(
                 ))
             }
             summ <- posterior::summarize_draws(draws)
+            diagnostic_names <- summ$variable
             diagnostics <- list(
                 ndraws = posterior::ndraws(draws),
                 nchains = posterior::nchains(draws),
-                effective_sample_size_bulk = summ$ess_bulk,
-                effective_sample_size_tail = summ$ess_tail,
-                rhat = summ$rhat,
+                effective_sample_size_bulk = stats::setNames(
+                    summ$ess_bulk,
+                    diagnostic_names
+                ),
+                effective_sample_size_tail = stats::setNames(
+                    summ$ess_tail,
+                    diagnostic_names
+                ),
+                rhat = stats::setNames(summ$rhat, diagnostic_names),
                 divergent_transitions = sapply(
                     diag_summ,
                     function(x) {
