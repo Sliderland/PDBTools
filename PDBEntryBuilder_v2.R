@@ -1,6 +1,4 @@
-library(R6)
-
-PDBEntryBuilder <- R6Class(
+PDBEntryBuilder <- R6::R6Class(
     "PDBEntryBuilder",
 
     public = list(
@@ -21,9 +19,28 @@ PDBEntryBuilder <- R6Class(
             detect_cores = TRUE,
             n_cores = NULL
         ) {
-            require(rstan)
-            require(posterior)
-            rstan_options(auto_write = auto_write)
+            required_packages <- c(
+                "rstan",
+                "posterior",
+                "posteriordb",
+                "checkmate"
+            )
+            missing_packages <- required_packages[
+                !vapply(
+                    required_packages,
+                    requireNamespace,
+                    logical(1),
+                    quietly = TRUE
+                )
+            ]
+            if (length(missing_packages) > 0L) {
+                stop(
+                    "Missing required packages: ",
+                    paste(missing_packages, collapse = ", "),
+                    call. = FALSE
+                )
+            }
+            rstan::rstan_options(auto_write = auto_write)
             if (detect_cores) {
                 options(mc.cores = parallel::detectCores())
             } else if (!is.null(n_cores)) {
@@ -527,62 +544,427 @@ PDBEntryBuilder <- R6Class(
             self$refresh()
             invisible(po)
         },
-        #TO DO
-        compute_reference = function(
-            posterior_name,
-            sampling_args = NULL,
-            seed = 123,
-            control_args = list(adapt_delta = 0.9),
-            comments = NULL,
-            added_by = self$adder,
-            check_and_write = TRUE,
+        run_entry_workflow = function(
+            entry_spec,
+            model = NULL,
+            register = TRUE,
+            sample = TRUE,
+            write = FALSE,
             overwrite = FALSE
         ) {
-            if (is.null(sampling_args)) {
-                ri <- list(
-                    name = posterior_name,
-                    inference = list(
-                        method = "stan_sampling",
-                        method_arguments = list(
-                            chains = 10,
-                            iter = 20000,
-                            warmup = 10000,
-                            thin = 10,
-                            refresh = 10000,
-                            seed = seed,
-                            control = control_args
-                        ),
-                        diagnostics = NULL,
-                        checks_made = NULL,
-                        comments = comments,
-                        added_by = self$adder,
-                        added_date = Sys.Date(),
-                        versions = NULL
-                    )
-                )
-            } else {
-                ri <- list(
-                    name = posterior_name,
-                    inference = sampling_args,
-                    diagnostics = NULL,
-                    checks_made = NULL,
-                    comments = comments,
-                    added_by = self$adder,
-                    added_date = Sys.Date(),
-                    versions = NULL
-                )
-            }
-            rpi <- posteriordb::as.pdb_reference_posterior_info(ri)
-            rp <- posteriordb::compute_reference_posterior_draws(
-                rpi,
-                private$pdb
+            results <- self$run_workflows(
+                model = model,
+                entries = list(entry = entry_spec),
+                register = register,
+                sample = sample,
+                write = write,
+                overwrite = overwrite,
+                continue_on_error = FALSE
             )
-            if (check_and_write) {
-                rp <- self$check_reference_draws(rp)
-                posteriordb::write_pdb(rp, private$pdb, overwrite = overwrite)
+            invisible(results[[1L]])
+        },
+        run_workflows = function(
+            model = NULL,
+            entries,
+            register = TRUE,
+            sample = TRUE,
+            write = FALSE,
+            overwrite = FALSE,
+            continue_on_error = TRUE
+        ) {
+            flags <- list(
+                register = register,
+                sample = sample,
+                write = write,
+                overwrite = overwrite,
+                continue_on_error = continue_on_error
+            )
+            for (flag_name in names(flags)) {
+                checkmate::assert_flag(flags[[flag_name]])
             }
-            # Uses private$pdb
-            invisible(rp)
+            if (write && !sample) {
+                stop("`write = TRUE` requires `sample = TRUE`.", call. = FALSE)
+            }
+            if (!is.list(entries) || length(entries) == 0L) {
+                stop("`entries` must be a non-empty list.", call. = FALSE)
+            }
+            if (is.null(names(entries))) {
+                names(entries) <- paste0("entry_", seq_along(entries))
+            }
+            if (anyNA(names(entries)) || any(names(entries) == "")) {
+                stop(
+                    "Every entry specification must have a name.",
+                    call. = FALSE
+                )
+            }
+            if (anyDuplicated(names(entries))) {
+                stop("Entry specification names must be unique.", call. = FALSE)
+            }
+
+            common_model_name <- NULL
+            model_object <- NULL
+            if (!is.null(model)) {
+                if (!is.list(model)) {
+                    stop("`model` must be NULL or a list.", call. = FALSE)
+                }
+                missing_model_fields <- setdiff(
+                    c("stan_file", "info"),
+                    names(model)
+                )
+                if (length(missing_model_fields) > 0L) {
+                    stop(
+                        paste0(
+                            "The model specification is missing: ",
+                            paste(missing_model_fields, collapse = ", ")
+                        ),
+                        call. = FALSE
+                    )
+                }
+                common_model_name <- model$info$name
+                if (is.null(common_model_name)) {
+                    stop("`model$info$name` is required.", call. = FALSE)
+                }
+                if (register) {
+                    model_overwrite <- if (is.null(model$overwrite)) {
+                        overwrite
+                    } else {
+                        model$overwrite
+                    }
+                    checkmate::assert_flag(model_overwrite)
+                    model_object <- self$add_model_code(
+                        stan_file = model$stan_file,
+                        info = model$info,
+                        overwrite = model_overwrite
+                    )
+                }
+            }
+
+            results <- vector("list", length(entries))
+            names(results) <- names(entries)
+
+            for (i in seq_along(entries)) {
+                entry_name <- names(entries)[[i]]
+                spec <- entries[[i]]
+                fit <- NULL
+                posterior_object <- NULL
+
+                message(
+                    "Starting workflow ",
+                    i,
+                    " of ",
+                    length(entries),
+                    ": ",
+                    entry_name
+                )
+
+                result <- tryCatch(
+                    {
+                        if (!is.list(spec)) {
+                            stop("The entry specification must be a list.")
+                        }
+                        data_spec <- spec$data
+                        posterior_spec <- spec$posterior
+                        reference_spec <- spec$reference
+
+                        if (is.null(posterior_spec)) {
+                            posterior_spec <- list()
+                        }
+                        if (!is.list(posterior_spec)) {
+                            stop("`entry_spec$posterior` must be a list.")
+                        }
+
+                        data_name <- posterior_spec$data_name
+                        if (is.null(data_name) && !is.null(data_spec)) {
+                            data_name <- data_spec$info$name
+                        }
+                        model_name <- posterior_spec$model_name
+                        if (is.null(model_name)) {
+                            model_name <- common_model_name
+                        }
+                        if (is.null(data_name) || is.null(model_name)) {
+                            stop(
+                                "Each entry must resolve `data_name` and `model_name`."
+                            )
+                        }
+
+                        entry_overwrite <- if (is.null(spec$overwrite)) {
+                            overwrite
+                        } else {
+                            spec$overwrite
+                        }
+                        checkmate::assert_flag(entry_overwrite)
+
+                        if (register) {
+                            if (
+                                !is.list(data_spec) ||
+                                    is.null(data_spec$data) ||
+                                    is.null(data_spec$info)
+                            ) {
+                                stop(
+                                    paste0(
+                                        "`entry_spec$data` must contain `data` ",
+                                        "and `info` when `register = TRUE`."
+                                    )
+                                )
+                            }
+                            self$add_data(
+                                data = data_spec$data,
+                                info = data_spec$info,
+                                overwrite = entry_overwrite
+                            )
+
+                            posterior_spec$data_name <- data_name
+                            posterior_spec$model_name <- model_name
+                            allowed_posterior_args <- names(
+                                formals(self$prepare_posterior)
+                            )
+                            unknown_posterior_args <- setdiff(
+                                names(posterior_spec),
+                                allowed_posterior_args
+                            )
+                            if (length(unknown_posterior_args) > 0L) {
+                                stop(
+                                    paste0(
+                                        "Unknown posterior specification fields: ",
+                                        paste(
+                                            unknown_posterior_args,
+                                            collapse = ", "
+                                        )
+                                    )
+                                )
+                            }
+                            posterior_object <- do.call(
+                                self$prepare_posterior,
+                                posterior_spec
+                            )
+                            posterior_object <- self$add_posterior(
+                                spec = posterior_object,
+                                overwrite = entry_overwrite,
+                                dry_run = FALSE
+                            )
+                        }
+
+                        posterior_name <- if (!is.null(spec$posterior_name)) {
+                            spec$posterior_name
+                        } else if (!is.null(posterior_object$name)) {
+                            posterior_object$name
+                        } else {
+                            paste(data_name, model_name, sep = "-")
+                        }
+
+                        checks <- NULL
+                        failed_checks <- character()
+                        divergences_by_chain <- NULL
+                        total_divergences <- NA_real_
+                        written <- FALSE
+                        info_path <- NULL
+                        draws_path <- NULL
+
+                        if (sample) {
+                            if (
+                                !is.list(reference_spec) ||
+                                    is.null(reference_spec$sampling_args)
+                            ) {
+                                stop(
+                                    paste0(
+                                        "`entry_spec$reference$sampling_args` ",
+                                        "is required when `sample = TRUE`."
+                                    )
+                                )
+                            }
+                            reference_args <- reference_spec
+                            reference_args$sampling_args <- NULL
+                            allowed_reference_args <- setdiff(
+                                names(formals(self$compute_reference_draws)),
+                                c(
+                                    "posterior_name",
+                                    "sampling_args",
+                                    "auto_check",
+                                    "write",
+                                    "overwrite"
+                                )
+                            )
+                            unknown_reference_args <- setdiff(
+                                names(reference_args),
+                                allowed_reference_args
+                            )
+                            if (length(unknown_reference_args) > 0L) {
+                                stop(
+                                    paste0(
+                                        "Unknown reference specification fields: ",
+                                        paste(
+                                            unknown_reference_args,
+                                            collapse = ", "
+                                        )
+                                    )
+                                )
+                            }
+                            compute_args <- c(
+                                list(
+                                    posterior_name = posterior_name,
+                                    sampling_args = reference_spec$sampling_args,
+                                    auto_check = FALSE,
+                                    write = FALSE,
+                                    overwrite = entry_overwrite
+                                ),
+                                reference_args
+                            )
+                            fit <- do.call(
+                                self$compute_reference_draws,
+                                compute_args
+                            )
+
+                            fit_info <- self$get_reference_info(fit)
+                            divergences_by_chain <-
+                                fit_info$diagnostics$divergent_transitions
+                            total_divergences <- if (
+                                length(divergences_by_chain) > 0L &&
+                                    !anyNA(divergences_by_chain) &&
+                                    all(is.finite(divergences_by_chain))
+                            ) {
+                                sum(divergences_by_chain)
+                            } else {
+                                NA_real_
+                            }
+
+                            if (
+                                is.na(total_divergences) ||
+                                    total_divergences > 0L
+                            ) {
+                                failed_checks <- "divergent_transitions"
+                            } else {
+                                checks <- self$get_checks_from_stanfit(fit)
+                                failed_checks <- names(checks)[
+                                    !vapply(checks, isTRUE, logical(1))
+                                ]
+                            }
+
+                            if (length(failed_checks) == 0L) {
+                                fit <- self$check_draws_from_stanfit(fit)
+                                if (write) {
+                                    info_path <- self$write_rpi_from_stan_fit(
+                                        fit,
+                                        overwrite = entry_overwrite,
+                                        verify = TRUE
+                                    )
+                                    draws_path <- self$write_rpd_from_stan_fit(
+                                        fit,
+                                        overwrite = entry_overwrite,
+                                        verify = TRUE
+                                    )
+                                    self$verify_reference_files(fit)
+                                    written <- TRUE
+                                }
+                            }
+                        }
+
+                        status <- if (length(failed_checks) > 0L) {
+                            "failed_checks"
+                        } else {
+                            "completed"
+                        }
+                        message(entry_name, " finished with status: ", status)
+                        list(
+                            name = entry_name,
+                            posterior_name = posterior_name,
+                            status = status,
+                            model = model_object,
+                            posterior = posterior_object,
+                            fit = fit,
+                            diagnostics = if (is.null(fit)) {
+                                NULL
+                            } else {
+                                self$get_reference_info(fit)$diagnostics
+                            },
+                            divergences_by_chain = divergences_by_chain,
+                            total_divergences = total_divergences,
+                            checks = checks,
+                            failed_checks = failed_checks,
+                            written = written,
+                            info_path = info_path,
+                            draws_path = draws_path,
+                            error = NULL
+                        )
+                    },
+                    error = function(e) {
+                        message(entry_name, " failed: ", conditionMessage(e))
+                        list(
+                            name = entry_name,
+                            posterior_name = NULL,
+                            status = "error",
+                            model = model_object,
+                            posterior = posterior_object,
+                            fit = fit,
+                            diagnostics = NULL,
+                            divergences_by_chain = NULL,
+                            total_divergences = NA_real_,
+                            checks = NULL,
+                            failed_checks = character(),
+                            written = FALSE,
+                            info_path = NULL,
+                            draws_path = NULL,
+                            error = conditionMessage(e)
+                        )
+                    }
+                )
+                results[[i]] <- result
+
+                if (
+                    identical(result$status, "error") &&
+                        !continue_on_error
+                ) {
+                    stop(result$error, call. = FALSE)
+                }
+            }
+
+            class(results) <- c("pdb_workflow_results", "list")
+            invisible(results)
+        },
+        summarize_workflow_results = function(results) {
+            if (!inherits(results, "pdb_workflow_results")) {
+                stop(
+                    "`results` must come from `run_workflows()`.",
+                    call. = FALSE
+                )
+            }
+            data.frame(
+                name = names(results),
+                posterior = vapply(
+                    results,
+                    function(x) {
+                        if (is.null(x$posterior_name)) {
+                            NA_character_
+                        } else {
+                            x$posterior_name
+                        }
+                    },
+                    character(1)
+                ),
+                status = vapply(results, function(x) x$status, character(1)),
+                divergences = vapply(
+                    results,
+                    function(x) x$total_divergences,
+                    numeric(1)
+                ),
+                failed_checks = vapply(
+                    results,
+                    function(x) paste(x$failed_checks, collapse = ", "),
+                    character(1)
+                ),
+                written = vapply(
+                    results,
+                    function(x) x$written,
+                    logical(1)
+                ),
+                error = vapply(
+                    results,
+                    function(x) {
+                        if (is.null(x$error)) NA_character_ else x$error
+                    },
+                    character(1)
+                ),
+                row.names = NULL
+            )
         },
         compute_reference_draws = function(
             posterior_name,
@@ -613,47 +995,58 @@ PDBEntryBuilder <- R6Class(
             }
             stan_fit <- do.call(rstan::sampling, sa)
             stan_fit@model_name <- posterior_name
-            info(stan_fit) <- list(
-                name = posterior_name,
-                inference = list(
-                    method = "stan_sampling",
-                    method_arguments = inference
-                ),
-                diagnostics = self$get_diagnostics(stan_fit, to_keep = ),
-                checks_made = list(),
-                comments = comments,
-                added_by = added_by,
-                added_date = Sys.Date(),
-                versions = private$get_sampling_version_info()
+            stan_fit <- self$set_reference_info(
+                stan_fit,
+                list(
+                    name = posterior_name,
+                    inference = list(
+                        method = "stan_sampling",
+                        method_arguments = inference
+                    ),
+                    diagnostics = self$get_diagnostics(stan_fit),
+                    checks_made = list(),
+                    comments = comments,
+                    added_by = added_by,
+                    added_date = Sys.Date(),
+                    versions = private$get_sampling_version_info()
+                )
             )
             if (auto_check) {
                 stan_fit <- self$check_draws_from_stanfit(stan_fit)
             }
-            #TO DO: Write_reference_draws_from_stan_fit
-            # if (write) {
-            #     self$write_reference_draws(stan_fit, overwrite = overwrite)
-            # }
-            stan_fit
+            if (write) {
+                self$write_rpi_from_stan_fit(stan_fit, overwrite = overwrite)
+                self$write_rpd_from_stan_fit(
+                    stan_fit,
+                    overwrite = overwrite,
+                    verify = TRUE
+                )
+            }
+            invisible(stan_fit)
         },
-        write_rpi_from_stan_fit = function(stan_fit) {
-            if (is.null(info(stan_fit))) {
+        write_rpi_from_stan_fit = function(
+            stan_fit,
+            overwrite = FALSE,
+            verify = TRUE
+        ) {
+            if (is.null(self$get_reference_info(stan_fit))) {
                 stop(
                     "`stan_fit` object must contain reference draw info. Call `add_rpi_from_stanfit()`",
                     call. = FALSE
                 )
             }
-            info <- info(stan_fit)
+            info <- self$get_reference_info(stan_fit)
             if (is.null(info$checks_made)) {
                 stop(
                     "Draws must be checked before writing. Call `check_draws_from_stanfit()`",
                     call. = FALSE
                 )
             }
-            checks <- unlist(info$checks_made)
             required_checks <- c(
                 "ndraws_is_10k",
                 "nchains_is_gte_4",
                 "r_hat_below_1_01",
+                "ess_within_bounds",
                 "efmi_above_0_2",
                 "abs_mean_lag1_ac_below_0_05"
             )
@@ -673,12 +1066,57 @@ PDBEntryBuilder <- R6Class(
                     call. = FALSE
                 )
             }
-            jsonlite::write_json(
-                info(stan_fit),
-                self$get_rpi_path(stan_fit@model_name)
+            info_path <- self$get_rpi_path(stan_fit@model_name)
+            dir.create(
+                dirname(info_path),
+                recursive = TRUE,
+                showWarnings = FALSE
             )
+            if (file.exists(info_path) && !overwrite) {
+                stop(
+                    "Reference-posterior information already exists.",
+                    call. = FALSE
+                )
+            }
+            temp_info <- tempfile(
+                pattern = paste0(stan_fit@model_name, "-"),
+                tmpdir = dirname(info_path),
+                fileext = ".json"
+            )
+            on.exit(unlink(temp_info, force = TRUE), add = TRUE)
+            jsonlite::write_json(
+                info,
+                temp_info,
+                pretty = TRUE,
+                auto_unbox = TRUE,
+                null = "null",
+                digits = NA
+            )
+            if (!file.copy(temp_info, info_path, overwrite = overwrite)) {
+                stop(
+                    "Failed to write reference-posterior information.",
+                    call. = FALSE
+                )
+            }
+            if (verify) {
+                loaded_info <- jsonlite::read_json(
+                    info_path,
+                    simplifyVector = FALSE
+                )
+                if (!identical(loaded_info$name, info$name)) {
+                    stop(
+                        "Written reference-posterior information failed verification.",
+                        call. = FALSE
+                    )
+                }
+            }
+            invisible(info_path)
         },
-        write_rpd_from_stan_fit = function(stan_fit) {
+        write_rpd_from_stan_fit = function(
+            stan_fit,
+            overwrite = FALSE,
+            verify = TRUE
+        ) {
             if (!file.exists(self$get_rpi_path(stan_fit@model_name))) {
                 stop(
                     "Make sure to write the reference posterior information to disk before writing the draws",
@@ -688,186 +1126,214 @@ PDBEntryBuilder <- R6Class(
             to_keep <- self$get_posterior_dims(stan_fit@model_name)
             draws <- posterior::subset_draws(
                 posterior::as_draws_array(stan_fit),
-                to_keep
+                variable = names(to_keep)
             )
             rp_path <- self$get_rp_path(stan_fit@model_name)
-            jsonlite::write_json(draws, rp_path)
-            zip(rp_path)
-            file.remove(rp_path)
+            dir.create(dirname(rp_path), recursive = TRUE, showWarnings = FALSE)
+            if (file.exists(rp_path) && !overwrite) {
+                stop("Reference-draw archive already exists.", call. = FALSE)
+            }
+            temp_dir <- tempfile(
+                pattern = paste0(stan_fit@model_name, "-"),
+                tmpdir = dirname(rp_path)
+            )
+            dir.create(temp_dir)
+            json_path <- file.path(
+                temp_dir,
+                paste0(stan_fit@model_name, ".json")
+            )
+            temp_zip <- tempfile(
+                pattern = paste0(stan_fit@model_name, "-"),
+                tmpdir = dirname(rp_path),
+                fileext = ".json.zip"
+            )
+            on.exit(
+                {
+                    unlink(temp_zip, force = TRUE)
+                    unlink(temp_dir, recursive = TRUE, force = TRUE)
+                },
+                add = TRUE
+            )
+            jsonlite::write_json(draws, json_path, digits = NA, null = "null")
+            zip_status <- utils::zip(
+                zipfile = temp_zip,
+                files = json_path,
+                flags = "-jq"
+            )
+            if (!identical(zip_status, 0L) || !file.exists(temp_zip)) {
+                stop(
+                    "Failed to create the reference-draw archive.",
+                    call. = FALSE
+                )
+            }
+            if (!file.copy(temp_zip, rp_path, overwrite = overwrite)) {
+                stop(
+                    "Failed to write the reference-draw archive.",
+                    call. = FALSE
+                )
+            }
+            if (verify) {
+                self$verify_reference_files(stan_fit, expected_draws = draws)
+            }
+            invisible(rp_path)
+        },
+        read_reference_files = function(posterior_name) {
+            info_path <- self$get_rpi_path(posterior_name)
+            draws_path <- self$get_rp_path(posterior_name)
+            if (!file.exists(info_path) || !file.exists(draws_path)) {
+                stop(
+                    "Reference-posterior information or draws are missing.",
+                    call. = FALSE
+                )
+            }
+            archive <- utils::unzip(draws_path, list = TRUE)
+            expected_member <- paste0(posterior_name, ".json")
+            if (
+                nrow(archive) != 1L ||
+                    basename(archive$Name[[1]]) != expected_member
+            ) {
+                stop(
+                    "Reference-draw archive has an unexpected structure.",
+                    call. = FALSE
+                )
+            }
+            extraction_dir <- tempfile(pattern = paste0(posterior_name, "-"))
+            dir.create(extraction_dir)
+            on.exit(
+                unlink(extraction_dir, recursive = TRUE, force = TRUE),
+                add = TRUE
+            )
+            extracted <- utils::unzip(
+                draws_path,
+                files = archive$Name[[1]],
+                exdir = extraction_dir
+            )
+            list(
+                info = jsonlite::read_json(info_path, simplifyVector = FALSE),
+                draws = jsonlite::read_json(extracted, simplifyVector = TRUE),
+                archive_member = archive$Name[[1]]
+            )
+        },
+        verify_reference_files = function(stan_fit, expected_draws = NULL) {
+            posterior_name <- stan_fit@model_name
+            if (is.null(expected_draws)) {
+                variables <- names(self$get_posterior_dims(posterior_name))
+                expected_draws <- posterior::subset_draws(
+                    posterior::as_draws_array(stan_fit),
+                    variable = variables
+                )
+            }
+            loaded <- self$read_reference_files(posterior_name)
+            if (!identical(loaded$info$name, posterior_name)) {
+                stop(
+                    "Reference-posterior name changed during the write/read round trip.",
+                    call. = FALSE
+                )
+            }
+            loaded_values <- unlist(
+                loaded$draws,
+                recursive = TRUE,
+                use.names = FALSE
+            )
+            expected_values <- as.numeric(unclass(expected_draws))
+            if (length(loaded_values) != length(expected_values)) {
+                stop(
+                    "Reference-draw dimensions changed during the write/read round trip.",
+                    call. = FALSE
+                )
+            }
+            if (
+                !isTRUE(all.equal(
+                    as.numeric(loaded_values),
+                    expected_values,
+                    tolerance = sqrt(.Machine$double.eps),
+                    check.attributes = FALSE
+                ))
+            ) {
+                stop(
+                    "Reference-draw values changed during the write/read round trip.",
+                    call. = FALSE
+                )
+            }
             invisible(TRUE)
         },
-        add_reference_draw_info_stanfit = function(stan_fit) {},
-        check_reference_draws = function(rp) {
-            if (is.null(rp)) {
-                if (is.null(self$get_rp())) {
-                    stop("Reference draws not found.", call. = FALSE)
-                }
-                posteriordb::check_reference_posterior_draws(x = self$get_rp())
-            } else {
-                posteriordb::check_reference_posterior_draws(x = rp)
-            }
-        },
-        check_draws_from_stanfit = function(stan_fit, attach = FALSE) {
-            if (is.null(info(stan_fit)$diagnostics)) {
+        get_checks_from_stanfit = function(stan_fit, diagnostics = NULL) {
+            if (is.null(diagnostics)) {
                 diagnostics <- self$get_diagnostics(stan_fit)
-                info(stan_fit)$diagnostics <- self$get_diagnostics(stan_fit)
-            } else {
-                diagnostics <- info(stan_fit)$diagnostics
             }
-            if (any(diagnostics$divergent_transitions > 0)) {
+            if (
+                anyNA(diagnostics$divergent_transitions) ||
+                    any(!is.finite(diagnostics$divergent_transitions)) ||
+                    any(diagnostics$divergent_transitions > 0)
+            ) {
                 stop(
-                    "There were divergent transitions during sampling.",
+                    "There were invalid or divergent transitions during sampling.",
                     call. = FALSE
                 )
             }
             ess_bounds <- self$generate_ess_bounds(diagnostics$ndraws)
-
             ess_within_bounds <-
-                within_bounds(
+                self$is_within_bounds(
                     diagnostics$effective_sample_size_bulk,
                     ess_bounds$ess_bulk
                 ) &&
-                within_bounds(
+                self$is_within_bounds(
                     diagnostics$effective_sample_size_tail,
                     ess_bounds$ess_tail
                 )
-            checks_made <- list(
-                n_draws_is_10k = diagnostics$ndraws == 10000,
+            diagnostic_draws <- posterior::subset_draws(
+                posterior::as_draws_array(stan_fit),
+                variable = names(diagnostics$rhat)
+            )
+            list(
+                ndraws_is_10k = diagnostics$ndraws == 10000,
                 nchains_is_gte_4 = diagnostics$nchains >= 4,
                 r_hat_below_1_01 = self$check_rhat(
-                    stan_fit,
-                    diagnostics$rhat
+                    draws = diagnostic_draws,
+                    rhat = diagnostics$rhat
                 ),
                 ess_within_bounds = ess_within_bounds,
-                efmi_above_0_2 = all(diagnostics$efmi >= 0.2),
-                abs_mean_lag1_ac_below_0_05 = all(
-                    diagnostics$mean_lag1_ac <= 0.05
-                )
+                efmi_above_0_2 = !anyNA(diagnostics$efmi) &&
+                    all(is.finite(diagnostics$efmi)) &&
+                    all(diagnostics$efmi >= 0.2),
+                abs_mean_lag1_ac_below_0_05 = all(is.finite(
+                    diagnostics$mean_lag1_ac[
+                        !is.na(diagnostics$mean_lag1_ac)
+                    ]
+                )) &&
+                    all(diagnostics$mean_lag1_ac <= 0.05, na.rm = TRUE)
             )
-            if (attach) {
-                info(stan_fit)$checks_made <- checks_made
-            } else {
-                invisible(checks_made)
-            }
         },
-        check_draws = function(rp, write_mean_ac = FALSE) {
-            rpi <- info(rp)
-            if (is.null(rpi)) {
+        check_draws_from_stanfit = function(stan_fit) {
+            stan_info <- self$get_reference_info(stan_fit)
+            if (is.null(stan_info)) {
                 stop(
-                    "Posterior Reference Draws do not have required information attached.",
+                    "`stan_fit` does not have reference-draw information attached.",
                     call. = FALSE
                 )
             }
-            if (inherits(rpi, "list")) {
-                message(
-                    "Attempting to convert information list into `pdb_reference_posterior_info` object..."
-                )
-                rpi <- as.pdb_reference_posterior_info(rpi)
+            if (is.null(stan_info$diagnostics)) {
+                stan_info$diagnostics <- self$get_diagnostics(stan_fit)
             }
-            if (!inherits(rpi, "pdb_reference_posterior_info")) {
+            checks_made <- self$get_checks_from_stanfit(
+                stan_fit,
+                stan_info$diagnostics
+            )
+            failed_checks <- names(checks_made)[
+                !vapply(checks_made, isTRUE, logical(1))
+            ]
+            if (length(failed_checks) > 0L) {
                 stop(
-                    "Posterior information needs to be embedded as a `pdb_reference_posterior_info` object.",
+                    paste0(
+                        "The following checks did not pass: ",
+                        paste(failed_checks, collapse = ", ")
+                    ),
                     call. = FALSE
                 )
             }
-            checks_made <- rpi$checks_made
-            if (is.null(rpi$diagnostics)) {
-                rpi$diagnostics <- self$get_diagnostics(rp)
-            }
-            if (is.null(checks_made)) {
-                checks_made <- list()
-            }
-            #Collecting Diagnostic Information
-            # if (is.null(rpi$diagnostics)) {
-            #     named_vars <-
-            # }
-            # named_vars <- rpi$diagnostics$diagnostic_information$names
-
-            # summ <- posterior::summarize_draws(rp)
-            # summ <- summ[which(summ[, 1] == named_vars), ]
-            # rhat <- summ$rhat
-            # ess_bulk <- summ$ess_bulk
-            # ess_tail <- summ$ess_tail
-            if (is.null(rpi$diagnostics)) {
-                if (inherits(rp, "pdb_posterior_reference_draws")) {
-                    diagnostics <- posterior::as_draws_df(rstan)
-                }
-                num_divergent <- rpi$diagnostics$divergent_transitions
-            }
-            if (sum(num_divergent) > 0) {
-                stop(
-                    "There were divergent transitions during sampling.",
-                    call. = FALSE
-                )
-            }
-            if (self$check_missing("ndraws_is_10k", checks_made)) {
-                ndraws <- rpi$diagnostics$ndraws
-                checks_made$ndraws_is_10k <- ndraws == 10000
-            }
-            if (self$check_missing("nchains_is_gte_4", checks_made)) {
-                nchains <- rpi$diagnostics$nchains
-                checks_made$nchains_is_gte_4 <- nchains >= 4
-            }
-            if (self$check_missing("r_hat_below_1_01", checks_made)) {
-                rhat <- rpi$diagnostics$r_hat
-                curr_len <- length(rhat)
-                rhat_narm <- rhat |> na.omit()
-                if (curr_len != length(rhat_narm)) {
-                    message(
-                        paste0(
-                            "Some variables had undefined Rhat. ",
-                            "This may be expected for constant or ",
-                            "structurally constrained quantities. ",
-                            "Verify that the corresponding draws ",
-                            "are finite and legitimately constant "
-                        )
-                    )
-                }
-                checks_made$r_hat_below_1_01 <- self$check_rhat(rp, rhat)
-            }
-
-            if (self$check_missing("efmi_above_0_2", checks_made)) {
-                efmi <- rpi$diagnostics$expected_fraction_of_missing_information
-                checks_made$efmi_above_0_2 <- !anyNA(efmi) &&
-                    all(is.finite(efmi)) &&
-                    all(efmi > 0.2)
-            }
-            if (
-                self$check_missing("abs_mean_lag1_ac_below_0_05", checks_made)
-            ) {
-                if (is.null(rpi$diagnostics$mean_lag1_ac)) {
-                    mean_lag1_ac <- self$compute_mean_lag1_ac(
-                        posterior::as_draws_array(rp)
-                    )
-                    rpi$diagnostics$mean_lag1_ac <- mean_lag1_ac
-                    write_mean_ac <- TRUE
-                } else {
-                    mean_lag1_ac <- rpi$diagnostics$mean_lag1_ac
-                }
-                checks_made$abs_mean_lag1_ac_below_0_05 <- all(
-                    mean_lag1_ac < 0.05,
-                    na.rm = TRUE
-                )
-            }
-            checks_passed <- all(sapply(names(checks_made), function(x) {
-                if (is.na(checks_made[[x]])) {
-                    message(paste0(x, " could not be evaluated. "))
-                    return(FALSE)
-                } else if (!checks_made[[x]]) {
-                    message(paste0(x, " did not pass."))
-                    return(FALSE)
-                }
-                return(TRUE)
-            }))
-            if (!checks_passed) {
-                stop(call. = FALSE)
-            }
-            if (write_mean_ac && exists("mean_lag1_ac")) {
-                info(rp)$diagnostics$mean_lag1_ac <-
-                    rpi$diagnostics$mean_lag1_ac
-            }
-            info(rp)$checks_made <- checks_made
-            invisible(rp)
+            stan_info$checks_made <- checks_made
+            stan_fit <- self$set_reference_info(stan_fit, stan_info)
+            invisible(stan_fit)
         },
         generate_ess_bounds = function(ndraws = 10000) {
             approx_ess_sd <- sqrt(7) * sqrt(ndraws)
@@ -879,15 +1345,6 @@ PDBEntryBuilder <- R6Class(
                 !anyNA(x) &&
                 all(is.finite(x)) &&
                 all(x >= min(bounds) & x <= max(bounds))
-        },
-        compute_ac = function(x) {
-            x <- posterior::as_draws_array(x)
-            var_names <- posterior::variables(x)
-            abs(sapply(var_names, function(name) {
-                posterior::autocorrelation(
-                    posterior::extract_variable(x, name)
-                )[2]
-            }))
         },
         compute_mean_lag1_ac = function(x) {
             checkmate::assert_class(x, "draws")
@@ -1011,6 +1468,26 @@ PDBEntryBuilder <- R6Class(
 
             variable_names <- dimnames(draws)$variable
 
+            if (length(rhat) != length(variable_names)) {
+                stop(
+                    "R-hat values do not match the number of draw variables.",
+                    call. = FALSE
+                )
+            }
+            if (!is.null(names(rhat))) {
+                missing_rhat <- setdiff(variable_names, names(rhat))
+                if (length(missing_rhat) > 0L) {
+                    stop(
+                        paste0(
+                            "R-hat values are missing for: ",
+                            paste(missing_rhat, collapse = ", ")
+                        ),
+                        call. = FALSE
+                    )
+                }
+                rhat <- rhat[variable_names]
+            }
+
             all_finite <- apply(
                 draws,
                 3,
@@ -1091,12 +1568,19 @@ PDBEntryBuilder <- R6Class(
                 ))
             }
             summ <- posterior::summarize_draws(draws)
+            diagnostic_names <- summ$variable
             diagnostics <- list(
                 ndraws = posterior::ndraws(draws),
                 nchains = posterior::nchains(draws),
-                effective_sample_size_bulk = summ$ess_bulk,
-                effective_sample_size_tail = summ$ess_tail,
-                rhat = summ$rhat,
+                effective_sample_size_bulk = stats::setNames(
+                    summ$ess_bulk,
+                    diagnostic_names
+                ),
+                effective_sample_size_tail = stats::setNames(
+                    summ$ess_tail,
+                    diagnostic_names
+                ),
+                rhat = stats::setNames(summ$rhat, diagnostic_names),
                 divergent_transitions = sapply(
                     diag_summ,
                     function(x) {
@@ -1104,8 +1588,7 @@ PDBEntryBuilder <- R6Class(
                     }
                 ),
                 efmi = rstan::get_bfmi(stan_fit),
-                mean_lag1_ac = self$compute_mean_lag1_ac(draws),
-                mean_lag1_ac_posterior = self$compute_ac(draws)
+                mean_lag1_ac = self$compute_mean_lag1_ac(draws)
             )
             diagnostics
         },
@@ -1116,234 +1599,13 @@ PDBEntryBuilder <- R6Class(
             posterior_name <- paste0(posterior_name, ".json")
             posterior_path <- normalizePath(file.path(
                 self$get_pdb_path(),
-                local_posterior_path,
+                sub("^[/\\\\]+", "", local_posterior_path),
                 posterior_name
             ))
             jsonlite::read_json(posterior_path, simplifyVector = TRUE)
         },
         get_posterior_dims = function(po) {
             self$get_posterior_json(po)$dimensions
-        },
-        write_reference_draws = function(
-            rp,
-            recheck = TRUE,
-            overwrite = FALSE,
-            verify = TRUE
-        ) {
-            if (!inherits(rp, "pdb_reference_posterior_draws")) {
-                stop(
-                    "Reference draws must be of class `pdb_reference_posterior_draws`.",
-                    call. = FALSE
-                )
-            }
-
-            checkmate::assert_flag(recheck)
-            checkmate::assert_flag(overwrite)
-            checkmate::assert_flag(verify)
-
-            if (recheck) {
-                rp <- self$check_draws(rp)
-            }
-
-            rpi <- posteriordb::info(rp)
-            required_checks <- c(
-                "ndraws_is_10k",
-                "nchains_is_gte_4",
-                "r_hat_below_1_01",
-                "abs_mean_lag1_ac_below_0_05",
-                "efmi_above_0_2"
-            )
-            missing_checks <- setdiff(
-                required_checks,
-                names(rpi$checks_made)
-            )
-            if (length(missing_checks) > 0L) {
-                stop(
-                    paste0(
-                        "Missing required reference-draw checks: ",
-                        paste(missing_checks, collapse = ", ")
-                    ),
-                    call. = FALSE
-                )
-            }
-            failed_checks <- required_checks[
-                !vapply(
-                    rpi$checks_made[required_checks],
-                    isTRUE,
-                    logical(1)
-                )
-            ]
-            if (length(failed_checks) > 0L) {
-                stop(
-                    paste0(
-                        "Reference draws failed: ",
-                        paste(failed_checks, collapse = ", ")
-                    ),
-                    call. = FALSE
-                )
-            }
-            divergences <- rpi$diagnostics$divergent_transitions
-            if (
-                anyNA(divergences) ||
-                    any(!is.finite(divergences)) ||
-                    sum(divergences) > 0
-            ) {
-                stop(
-                    "Reference draws have invalid or divergent transitions.",
-                    call. = FALSE
-                )
-            }
-
-            pdb_root <- private$pdb$pdb_local_endpoint
-            if (
-                is.null(pdb_root) ||
-                    length(pdb_root) != 1L ||
-                    !dir.exists(pdb_root)
-            ) {
-                stop(
-                    "Could not resolve the local PosteriorDB root.",
-                    call. = FALSE
-                )
-            }
-
-            info_dir <- file.path(
-                pdb_root,
-                "reference_posteriors",
-                "draws",
-                "info"
-            )
-            draws_dir <- file.path(
-                pdb_root,
-                "reference_posteriors",
-                "draws",
-                "draws"
-            )
-            dir.create(info_dir, recursive = TRUE, showWarnings = FALSE)
-            dir.create(draws_dir, recursive = TRUE, showWarnings = FALSE)
-
-            info_path <- file.path(
-                info_dir,
-                paste0(rpi$name, ".info.json")
-            )
-            draws_zip_path <- file.path(
-                draws_dir,
-                paste0(rpi$name, ".json.zip")
-            )
-            output_paths <- c(info_path, draws_zip_path)
-
-            existing <- file.exists(output_paths)
-            if (any(existing) && !overwrite) {
-                stop(
-                    paste0(
-                        "Output already exists: ",
-                        paste(output_paths[existing], collapse = ", ")
-                    ),
-                    call. = FALSE
-                )
-            }
-
-            temp_info <- tempfile(
-                pattern = paste0(rpi$name, "-"),
-                tmpdir = info_dir,
-                fileext = ".info.json"
-            )
-            temp_draws_dir <- tempfile(
-                pattern = paste0(rpi$name, "-"),
-                tmpdir = draws_dir
-            )
-            dir.create(temp_draws_dir)
-            temp_draws <- file.path(
-                temp_draws_dir,
-                paste0(rpi$name, ".json")
-            )
-            temp_zip <- tempfile(
-                pattern = paste0(rpi$name, "-"),
-                tmpdir = draws_dir,
-                fileext = ".json.zip"
-            )
-            on.exit(
-                {
-                    unlink(temp_info, force = TRUE)
-                    unlink(temp_zip, force = TRUE)
-                    unlink(temp_draws_dir, recursive = TRUE, force = TRUE)
-                },
-                add = TRUE
-            )
-
-            info_for_json <- rpi
-            class(info_for_json) <- unique(c(class(info_for_json), "list"))
-            info_json <- jsonlite::toJSON(
-                info_for_json,
-                pretty = TRUE,
-                auto_unbox = TRUE,
-                null = "null",
-                digits = NA,
-                encoding = "UTF-8"
-            )
-            draws_json <- jsonlite::toJSON(
-                rp,
-                pretty = TRUE,
-                auto_unbox = TRUE,
-                null = "null",
-                digits = NA,
-                encoding = "UTF-8"
-            )
-            Encoding(info_json) <- "UTF-8"
-            Encoding(draws_json) <- "UTF-8"
-            writeLines(info_json, temp_info, useBytes = TRUE)
-            writeLines(draws_json, temp_draws, useBytes = TRUE)
-
-            zip_status <- utils::zip(
-                zipfile = temp_zip,
-                files = temp_draws,
-                flags = "-jq"
-            )
-            if (!identical(zip_status, 0L) || !file.exists(temp_zip)) {
-                stop(
-                    "Failed to create the reference-draw ZIP archive.",
-                    call. = FALSE
-                )
-            }
-            unlink(temp_draws, force = TRUE)
-
-            if (!file.copy(temp_info, info_path, overwrite = overwrite)) {
-                stop(
-                    "Failed to write the reference-draw info JSON.",
-                    call. = FALSE
-                )
-            }
-            if (!file.copy(temp_zip, draws_zip_path, overwrite = overwrite)) {
-                stop(
-                    "Failed to write the reference-draw ZIP archive.",
-                    call. = FALSE
-                )
-            }
-
-            if (verify) {
-                parsed_info <- jsonlite::fromJSON(
-                    info_path,
-                    simplifyVector = FALSE
-                )
-                if (!identical(parsed_info$name, rpi$name)) {
-                    stop(
-                        "Written reference-draw info failed verification.",
-                        call. = FALSE
-                    )
-                }
-                zip_listing <- utils::unzip(draws_zip_path, list = TRUE)
-                expected_member <- paste0(rpi$name, ".json")
-                if (
-                    nrow(zip_listing) != 1L ||
-                        basename(zip_listing$Name[1]) != expected_member
-                ) {
-                    stop(
-                        "Written reference-draw archive failed verification.",
-                        call. = FALSE
-                    )
-                }
-            }
-
-            invisible(rp)
         },
         is_constant = function(z, tolerance = sqrt(.Machine$double.eps)) {
             if (!all(is.finite(z))) {
@@ -1353,6 +1615,16 @@ PDBEntryBuilder <- R6Class(
             scale <- max(1, max(abs(z)))
             diff(range(z)) <= tolerance * scale
         },
+        get_reference_info = function(x) {
+            attr(x, "info", exact = TRUE)
+        },
+        set_reference_info = function(x, value) {
+            if (!is.list(value)) {
+                stop("Reference information must be a list.", call. = FALSE)
+            }
+            attr(x, "info") <- value
+            x
+        },
         add_bibtex_entry = function(bibtex_str) {
             write(
                 paste0("\n\n", bibtex_str, "\n"),
@@ -1361,32 +1633,6 @@ PDBEntryBuilder <- R6Class(
             )
             self$refresh()
         },
-        write_reference_draw_info = function(
-            info,
-            overwrite = FALSE,
-            local_refdraw_info = "/posterior_database/reference_posteriors/draws/info/"
-        ) {
-            if (inherits(info, "list")) {
-                info <- posteriordb::as.pdb_reference_posterior_info(info)
-            }
-            if (!inherits(info, "pdb_reference_posterior_info")) {
-                stop("Reference draw info needs to be posterior")
-            }
-            posteriordb::write_pdb(info, self$get_pdb(), overwrite = overwrite)
-        },
-        write_draws = function(draws) {
-            checkmate::assertTRUE(inherits(draws, "draws"))
-            checkmate::assertTRUE(inherits(
-                draws,
-                "pdb_reference_posterior_draws"
-            ))
-            posteriordb::write_pdb()
-        },
-        check_missing = function(name, checks) {
-            value <- checks[[name]]
-            is.null(value) || length(value) != 1L
-        },
-        add_bibtex_file = function(path) {},
         set_data = function(d) {
             self$data <- d
         },
@@ -1402,15 +1648,27 @@ PDBEntryBuilder <- R6Class(
         get_stan_model_code_path = function(
             local_model_path = "/posterior_database/models/stan/"
         ) {
-            normalizePath(file.path(self$get_pdb_path(), local_model_path))
+            normalizePath(file.path(
+                self$get_pdb_path(),
+                sub("^[/\\\\]+", "", local_model_path)
+            ))
         },
         get_data_path = function(
             local_data_path = "/posterior_database/data/data/"
         ) {
-            normalizePath(file.path(self$get_pdb_path(), local_data_path))
+            normalizePath(file.path(
+                self$get_pdb_path(),
+                sub("^[/\\\\]+", "", local_data_path)
+            ))
         },
         get_posterior_modeldata_files = function(posterior_name) {
             data_model_name <- strsplit(posterior_name, split = "-")[[1]]
+            if (length(data_model_name) < 2L) {
+                stop(
+                    "`posterior_name` must identify both data and model.",
+                    call. = FALSE
+                )
+            }
             data_file_name <- paste0(data_model_name[1], ".json.zip")
             model_file_name <- paste0(data_model_name[2], ".stan")
             list(
@@ -1425,35 +1683,31 @@ PDBEntryBuilder <- R6Class(
             )
         },
         get_posterior_modeldata = function(posterior_name) {
-            md_file <- self$get_posterior_modeldata_files(posterior_name)
-            files_exist <- sapply(dm_paths, file.exists)
+            md_files <- self$get_posterior_modeldata_files(posterior_name)
+            files_exist <- vapply(md_files, file.exists, logical(1))
             if (!all(files_exist)) {
                 stop(
                     paste0(
-                        "The data or model file does not exist.",
+                        "The data or model file does not exist. ",
                         "Please ensure you specified the correct posterior name."
                     ),
                     call. = FALSE
                 )
             }
             posterior_model <- rstan::stan_model(
-                file = dm_paths$model_file,
+                file = md_files$model_file,
                 model_name = posterior_name
             )
             posterior_model_code <- paste(
-                readLines(md_file$data_file),
+                readLines(md_files$model_file),
                 collapse = "\n"
             )
-            posterior_data <- unzip(self$copy_to_tempdir(
-                dm_paths$data_file,
-                unzip = TRUE,
-                return_data = TRUE
-            ))
+            posterior_data <- self$copy_to_tempdir(md_files$data_file)
             list(
                 data = posterior_data,
                 stan_model = posterior_model,
                 model_code = posterior_model_code,
-                stan_file = md_file$model_file
+                stan_file = md_files$model_file
             )
         },
         # get_reference_posterior_info = function(
@@ -1467,44 +1721,78 @@ PDBEntryBuilder <- R6Class(
             local_rpi_path = "/posterior_database/reference_posteriors/draws/info/"
         ) {
             rpi_name <- paste0(rpi_name, ".json")
-            normalizePath(file.path(
-                self$get_pdb_path(),
-                local_rpi_path,
-                rpi_name
-            ))
+            normalizePath(
+                file.path(
+                    self$get_pdb_path(),
+                    sub("^[/\\\\]+", "", local_rpi_path),
+                    rpi_name
+                ),
+                mustWork = FALSE
+            )
         },
         get_rp_path = function(
             rp_name,
             local_rp_path = "/posterior_database/reference_posteriors/draws/draws/"
         ) {
-            rp_name <- paste0(rp_name, ".json")
-            normalizePath(file.path(
-                self$get_pdb_path(),
-                local_rp_path,
-                rp_name
-            ))
+            rp_name <- paste0(rp_name, ".json.zip")
+            normalizePath(
+                file.path(
+                    self$get_pdb_path(),
+                    sub("^[/\\\\]+", "", local_rp_path),
+                    rp_name
+                ),
+                mustWork = FALSE
+            )
         },
         copy_to_tempdir = function(
             file_path,
             return_obj = TRUE,
             overwrite = TRUE
         ) {
-            if (grepl(".zip", file_path)) {
-                unzip <- TRUE
-            }
-            td <- normalizePath(base::tempdir())
-            copied_path <- normalizePath(file.path(td, basename(file_path)))
-            file.copy(
+            is_zip <- grepl("\\.zip$", file_path, ignore.case = TRUE)
+            task_dir <- tempfile(pattern = "pdb-entry-")
+            dir.create(task_dir)
+            on.exit(
+                unlink(task_dir, recursive = TRUE, force = TRUE),
+                add = TRUE
+            )
+            copied_path <- file.path(task_dir, basename(file_path))
+            copied <- file.copy(
                 from = file_path,
-                to = td,
+                to = copied_path,
                 overwrite = overwrite
             )
-            if (return_obj && unzip) {
-                jsonlite::read_json(unzip(copied_path), simplifyVector = TRUE)
+            if (!copied) {
+                stop(
+                    "Failed to copy file to a temporary directory.",
+                    call. = FALSE
+                )
+            }
+            if (return_obj && is_zip) {
+                archive <- utils::unzip(copied_path, list = TRUE)
+                if (nrow(archive) != 1L) {
+                    stop(
+                        "Expected a ZIP archive containing one file.",
+                        call. = FALSE
+                    )
+                }
+                extracted <- utils::unzip(
+                    copied_path,
+                    files = archive$Name[[1]],
+                    exdir = task_dir
+                )
+                jsonlite::read_json(extracted, simplifyVector = TRUE)
             } else if (return_obj) {
                 jsonlite::read_json(copied_path, simplifyVector = TRUE)
             } else {
-                copied_path
+                destination <- tempfile(
+                    pattern = "pdb-entry-copy-",
+                    fileext = paste0(".", tools::file_ext(file_path))
+                )
+                if (!file.copy(copied_path, destination, overwrite = TRUE)) {
+                    stop("Failed to retain the temporary copy.", call. = FALSE)
+                }
+                destination
             }
         },
         set_stan_file = function(sf) {
