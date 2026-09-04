@@ -1697,13 +1697,96 @@ PDBEntryBuilder <- R6::R6Class(
             attr(x, "info") <- value
             x
         },
+        search_data = function(query) {
+            private$search_database_entries(
+                query, "posterior_database/data/data",
+                "\\.json(?:\\.zip)?$", "data"
+            )
+        },
+        search_data_keywords = function(query) {
+            private$search_info_keywords(
+                query, "posterior_database/data/info", "data"
+            )
+        },
+        search_model = function(query) {
+            private$search_database_entries(
+                query, "posterior_database/models/info",
+                "\\.info\\.json$", "model"
+            )
+        },
+        search_model_keywords = function(query) {
+            private$search_info_keywords(
+                query, "posterior_database/models/info", "model"
+            )
+        },
+        search_posterior = function(query) {
+            private$search_database_entries(
+                query, "posterior_database/posteriors",
+                "\\.json$", "posterior"
+            )
+        },
+        search_reference_draws = function(query) {
+            private$search_database_entries(
+                query,
+                paste0(
+                    "posterior_database/reference_posteriors/",
+                    "draws/draws"
+                ),
+                "\\.json\\.zip$", "reference-draw"
+            )
+        },
         add_bibtex_entry = function(bibtex_str) {
+            checkmate::assert_string(bibtex_str, min.chars = 1L)
+
+            extract_keys <- function(x) {
+                pattern <- paste0(
+                    "@([[:alpha:]]+)\\s*[\\{(]\\s*",
+                    "([^,[:space:]]+)\\s*,"
+                )
+                matches <- regmatches(
+                    x,
+                    gregexpr(pattern, x, perl = TRUE, ignore.case = TRUE)
+                )[[1L]]
+                if (identical(matches, character(0))) return(character())
+                types <- sub(
+                    pattern, "\\1", matches,
+                    perl = TRUE, ignore.case = TRUE
+                )
+                keys <- sub(
+                    pattern, "\\2", matches,
+                    perl = TRUE, ignore.case = TRUE
+                )
+                keys[!tolower(types) %in% c("comment", "preamble", "string")]
+            }
+
+            new_keys <- extract_keys(bibtex_str)
+            if (length(new_keys) != 1L) {
+                stop(
+                    "`bibtex_str` must contain exactly one keyed BibTeX entry.",
+                    call. = FALSE
+                )
+            }
+            reference_path <- private$get_reference_path()
+            existing_text <- if (file.exists(reference_path)) {
+                paste(readLines(reference_path, warn = FALSE), collapse = "\n")
+            } else {
+                ""
+            }
+            if (tolower(new_keys) %in% tolower(extract_keys(existing_text))) {
+                message(
+                    "BibTeX entry `", new_keys,
+                    "` already exists; nothing was written."
+                )
+                return(invisible(FALSE))
+            }
+
             write(
                 paste0("\n\n", bibtex_str, "\n"),
-                file = private$get_reference_path(),
+                file = reference_path,
                 append = TRUE
             )
             self$refresh()
+            invisible(TRUE)
         },
         set_data = function(d) {
             self$data <- d
@@ -1998,6 +2081,88 @@ PDBEntryBuilder <- R6::R6Class(
 
     private = list(
         pdb = NULL,
+        search_database_entries = function(
+            query,
+            directory,
+            suffix_pattern,
+            entry_type
+        ) {
+            checkmate::assert_string(query, min.chars = 1L)
+            search_path <- file.path(self$path, directory)
+            if (!dir.exists(search_path)) {
+                stop(
+                    "Could not find the ", entry_type,
+                    " directory: ", search_path,
+                    call. = FALSE
+                )
+            }
+
+            files <- list.files(search_path, full.names = FALSE)
+            files <- files[grepl(
+                suffix_pattern, files,
+                ignore.case = TRUE, perl = TRUE
+            )]
+            names <- sub(
+                suffix_pattern, "", files,
+                ignore.case = TRUE, perl = TRUE
+            )
+            matches <- sort(unique(names[
+                grepl(tolower(query), tolower(names), fixed = TRUE)
+            ]))
+
+            if (length(matches) == 0L) {
+                message("No ", entry_type, " names matched `", query, "`.")
+            }
+            matches
+        },
+        search_info_keywords = function(query, directory, entry_type) {
+            checkmate::assert_string(query, min.chars = 1L)
+            search_path <- file.path(self$path, directory)
+            if (!dir.exists(search_path)) {
+                stop(
+                    "Could not find the ", entry_type,
+                    " info directory: ", search_path,
+                    call. = FALSE
+                )
+            }
+
+            info_files <- list.files(
+                search_path,
+                pattern = "\\.info\\.json$",
+                full.names = TRUE,
+                ignore.case = TRUE
+            )
+            matches <- vapply(info_files, function(info_file) {
+                info <- tryCatch(
+                    jsonlite::fromJSON(info_file, simplifyVector = FALSE),
+                    error = function(e) NULL
+                )
+                if (is.null(info)) return(NA_character_)
+                keywords <- as.character(unlist(
+                    info$keywords,
+                    recursive = TRUE,
+                    use.names = FALSE
+                ))
+                if (
+                    length(keywords) == 0L ||
+                        !any(grepl(
+                            tolower(query), tolower(keywords), fixed = TRUE
+                        ))
+                ) {
+                    return(NA_character_)
+                }
+                as.character(info$name)[1L]
+            }, character(1L), USE.NAMES = FALSE)
+            matches <- sort(unique(matches[!is.na(matches)]))
+
+            if (length(matches) == 0L) {
+                message(
+                    "No ", entry_type,
+                    " keywords matched `", query, "`."
+                )
+            }
+            matches
+        },
         get_sampling_version_info = function() {
             M <- file.path(
                 Sys.getenv("HOME"),
