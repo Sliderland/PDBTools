@@ -796,15 +796,15 @@ PDBEntryBuilder <- R6Class(
                     call. = FALSE
                 )
             }
-            if (self$check_missing("ndraws_is_10k", checks_made)) {
+            if (private$check_missing("ndraws_is_10k", checks_made)) {
                 ndraws <- rpi$diagnostics$ndraws
                 checks_made$ndraws_is_10k <- ndraws == 10000
             }
-            if (self$check_missing("nchains_is_gte_4", checks_made)) {
+            if (private$check_missing("nchains_is_gte_4", checks_made)) {
                 nchains <- rpi$diagnostics$nchains
                 checks_made$nchains_is_gte_4 <- nchains >= 4
             }
-            if (self$check_missing("r_hat_below_1_01", checks_made)) {
+            if (private$check_missing("r_hat_below_1_01", checks_made)) {
                 rhat <- rpi$diagnostics$r_hat
                 curr_len <- length(rhat)
                 rhat_narm <- rhat |> na.omit()
@@ -822,14 +822,16 @@ PDBEntryBuilder <- R6Class(
                 checks_made$r_hat_below_1_01 <- self$check_rhat(rp, rhat)
             }
 
-            if (self$check_missing("efmi_above_0_2", checks_made)) {
+            if (private$check_missing("efmi_above_0_2", checks_made)) {
                 efmi <- rpi$diagnostics$expected_fraction_of_missing_information
                 checks_made$efmi_above_0_2 <- !anyNA(efmi) &&
                     all(is.finite(efmi)) &&
                     all(efmi > 0.2)
             }
             if (
-                self$check_missing("abs_mean_lag1_ac_below_0_05", checks_made)
+                private$check_missing(
+                    "abs_mean_lag1_ac_below_0_05", checks_made
+                )
             ) {
                 if (is.null(rpi$diagnostics$mean_lag1_ac)) {
                     mean_lag1_ac <- self$compute_mean_lag1_ac(
@@ -1496,19 +1498,6 @@ PDBEntryBuilder <- R6Class(
             }
             posteriordb::write_pdb(info, self$get_pdb(), overwrite = overwrite)
         },
-        write_draws = function(draws) {
-            checkmate::assertTRUE(inherits(draws, "draws"))
-            checkmate::assertTRUE(inherits(
-                draws,
-                "pdb_reference_posterior_draws"
-            ))
-            posteriordb::write_pdb()
-        },
-        check_missing = function(name, checks) {
-            value <- checks[[name]]
-            is.null(value) || length(value) != 1L
-        },
-        add_bibtex_file = function(path) {},
         set_data = function(d) {
             self$data <- d
         },
@@ -1531,23 +1520,8 @@ PDBEntryBuilder <- R6Class(
         ) {
             normalizePath(file.path(self$get_pdb_path(), local_data_path))
         },
-        get_posterior_modeldata_files = function(posterior_name) {
-            data_model_name <- strsplit(posterior_name, split = "-")[[1]]
-            data_file_name <- paste0(data_model_name[1], ".json.zip")
-            model_file_name <- paste0(data_model_name[2], ".stan")
-            list(
-                "model_file" = normalizePath(file.path(
-                    self$get_stan_model_code_path(),
-                    model_file_name
-                )),
-                "data_file" = normalizePath(file.path(
-                    self$get_data_path(),
-                    data_file_name
-                ))
-            )
-        },
         get_posterior_modeldata = function(posterior_name) {
-            md_file <- self$get_posterior_modeldata_files(posterior_name)
+            md_file <- private$get_posterior_modeldata_files(posterior_name)
             files_exist <- sapply(dm_paths, file.exists)
             if (!all(files_exist)) {
                 stop(
@@ -1566,7 +1540,7 @@ PDBEntryBuilder <- R6Class(
                 readLines(md_file$data_file),
                 collapse = "\n"
             )
-            posterior_data <- unzip(self$copy_to_tempdir(
+            posterior_data <- unzip(private$copy_to_tempdir(
                 dm_paths$data_file,
                 unzip = TRUE,
                 return_data = TRUE
@@ -1620,18 +1594,6 @@ PDBEntryBuilder <- R6Class(
                 )
             )
         },
-        get_summary_statistic_paths = function(posterior_name, type) {
-            supported <- c("mean_value", "mean_squared_value")
-            checkmate::assert_choice(type, supported)
-            root <- file.path(
-                self$get_pdb_path(), "posterior_database",
-                "reference_posteriors", "summary_statistics", type
-            )
-            list(
-                info = file.path(root, "info", paste0(posterior_name, ".info.json")),
-                value = file.path(root, type, paste0(posterior_name, ".json"))
-            )
-        },
         write_summary_statistics_from_stan_fit = function(
             stan_fit, overwrite = FALSE, verify = TRUE
         ) {
@@ -1643,7 +1605,7 @@ PDBEntryBuilder <- R6Class(
                 "posterior R package, version ", utils::packageVersion("posterior")
             )
             paths <- lapply(names(summaries), function(type) {
-                self$get_summary_statistic_paths(stan_fit@model_name, type)
+                private$get_summary_statistic_paths(stan_fit@model_name, type)
             })
             names(paths) <- names(summaries)
             destinations <- unlist(paths, use.names = FALSE)
@@ -1694,29 +1656,6 @@ PDBEntryBuilder <- R6Class(
                 rp_name
             ))
         },
-        copy_to_tempdir = function(
-            file_path,
-            return_obj = TRUE,
-            overwrite = TRUE
-        ) {
-            if (grepl(".zip", file_path)) {
-                unzip <- TRUE
-            }
-            td <- normalizePath(base::tempdir())
-            copied_path <- normalizePath(file.path(td, basename(file_path)))
-            file.copy(
-                from = file_path,
-                to = td,
-                overwrite = overwrite
-            )
-            if (return_obj && unzip) {
-                jsonlite::read_json(unzip(copied_path), simplifyVector = TRUE)
-            } else if (return_obj) {
-                jsonlite::read_json(copied_path, simplifyVector = TRUE)
-            } else {
-                copied_path
-            }
-        },
         set_stan_file = function(sf) {
             self$stan_file <- sf
         },
@@ -1755,6 +1694,64 @@ PDBEntryBuilder <- R6Class(
 
     private = list(
         pdb = NULL,
+        check_missing = function(name, checks) {
+            value <- checks[[name]]
+            is.null(value) || length(value) != 1L
+        },
+        get_posterior_modeldata_files = function(posterior_name) {
+            data_model_name <- strsplit(posterior_name, split = "-")[[1]]
+            data_file_name <- paste0(data_model_name[1], ".json.zip")
+            model_file_name <- paste0(data_model_name[2], ".stan")
+            list(
+                "model_file" = normalizePath(file.path(
+                    self$get_stan_model_code_path(),
+                    model_file_name
+                )),
+                "data_file" = normalizePath(file.path(
+                    self$get_data_path(),
+                    data_file_name
+                ))
+            )
+        },
+        get_summary_statistic_paths = function(posterior_name, type) {
+            supported <- c("mean_value", "mean_squared_value")
+            checkmate::assert_choice(type, supported)
+            root <- file.path(
+                self$get_pdb_path(), "posterior_database",
+                "reference_posteriors", "summary_statistics", type
+            )
+            list(
+                info = file.path(
+                    root, "info", paste0(posterior_name, ".info.json")
+                ),
+                value = file.path(
+                    root, type, paste0(posterior_name, ".json")
+                )
+            )
+        },
+        copy_to_tempdir = function(
+            file_path,
+            return_obj = TRUE,
+            overwrite = TRUE
+        ) {
+            if (grepl(".zip", file_path)) {
+                unzip <- TRUE
+            }
+            td <- normalizePath(base::tempdir())
+            copied_path <- normalizePath(file.path(td, basename(file_path)))
+            file.copy(
+                from = file_path,
+                to = td,
+                overwrite = overwrite
+            )
+            if (return_obj && unzip) {
+                jsonlite::read_json(unzip(copied_path), simplifyVector = TRUE)
+            } else if (return_obj) {
+                jsonlite::read_json(copied_path, simplifyVector = TRUE)
+            } else {
+                copied_path
+            }
+        },
         search_database_entries = function(
             query,
             directory,

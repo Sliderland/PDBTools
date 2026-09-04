@@ -1365,29 +1365,8 @@ PDBEntryBuilder <- R6::R6Class(
                 sub("^[/\\\\]+", "", local_data_path)
             ))
         },
-        get_posterior_modeldata_files = function(posterior_name) {
-            data_model_name <- strsplit(posterior_name, split = "-")[[1]]
-            if (length(data_model_name) < 2L) {
-                stop(
-                    "`posterior_name` must identify both data and model.",
-                    call. = FALSE
-                )
-            }
-            data_file_name <- paste0(data_model_name[1], ".json.zip")
-            model_file_name <- paste0(data_model_name[2], ".stan")
-            list(
-                "model_file" = normalizePath(file.path(
-                    self$get_stan_model_code_path(),
-                    model_file_name
-                )),
-                "data_file" = normalizePath(file.path(
-                    self$get_data_path(),
-                    data_file_name
-                ))
-            )
-        },
         get_posterior_modeldata = function(posterior_name) {
-            md_files <- self$get_posterior_modeldata_files(posterior_name)
+            md_files <- private$get_posterior_modeldata_files(posterior_name)
             files_exist <- vapply(md_files, file.exists, logical(1))
             if (!all(files_exist)) {
                 stop(
@@ -1406,7 +1385,7 @@ PDBEntryBuilder <- R6::R6Class(
                 readLines(md_files$model_file),
                 collapse = "\n"
             )
-            posterior_data <- self$copy_to_tempdir(md_files$data_file)
+            posterior_data <- private$copy_to_tempdir(md_files$data_file)
             list(
                 data = posterior_data,
                 stan_model = posterior_model,
@@ -1464,22 +1443,6 @@ PDBEntryBuilder <- R6::R6Class(
                 )
             )
         },
-        get_summary_statistic_paths = function(posterior_name, type) {
-            supported <- c("mean_value", "mean_squared_value")
-            checkmate::assert_choice(type, supported)
-            root <- file.path(
-                self$get_pdb_path(), "posterior_database",
-                "reference_posteriors", "summary_statistics", type
-            )
-            list(
-                info = file.path(
-                    root, "info", paste0(posterior_name, ".info.json")
-                ),
-                value = file.path(
-                    root, type, paste0(posterior_name, ".json")
-                )
-            )
-        },
         write_summary_statistics_from_stan_fit = function(
             stan_fit,
             overwrite = FALSE,
@@ -1494,7 +1457,7 @@ PDBEntryBuilder <- R6::R6Class(
                 utils::packageVersion("posterior")
             )
             paths <- lapply(names(summaries), function(type) {
-                self$get_summary_statistic_paths(stan_fit@model_name, type)
+                private$get_summary_statistic_paths(stan_fit@model_name, type)
             })
             names(paths) <- names(summaries)
             destinations <- unlist(paths, use.names = FALSE)
@@ -1564,6 +1527,81 @@ PDBEntryBuilder <- R6::R6Class(
                 mustWork = FALSE
             )
         },
+        set_stan_file = function(sf) {
+            self$stan_file <- sf
+        },
+        get_stan_file = function() {
+            self$stan_file
+        },
+        set_posterior = function(p) {
+            self$posterior <- p
+        },
+        get_posterior = function() {
+            self$posterior
+        },
+        set_rp = function(rp) {
+            self$rp <- rp
+        },
+        get_rp = function() {
+            self$rp
+        },
+        get_added_by = function() {
+            self$adder
+        },
+        set_added_by = function(added_by) {
+            self$adder <- added_by
+        },
+        refresh = function() {
+            private$pdb <- posteriordb::pdb_local(path = self$path)
+            invisible(self)
+        },
+        get_pdb = function() {
+            private$pdb
+        },
+        get_pdb_path = function() {
+            self$path
+        }
+    ),
+
+    private = list(
+        pdb = NULL,
+        get_posterior_modeldata_files = function(posterior_name) {
+            data_model_name <- strsplit(posterior_name, split = "-")[[1]]
+            if (length(data_model_name) < 2L) {
+                stop(
+                    "`posterior_name` must identify both data and model.",
+                    call. = FALSE
+                )
+            }
+            data_file_name <- paste0(data_model_name[1], ".json.zip")
+            model_file_name <- paste0(data_model_name[2], ".stan")
+            list(
+                "model_file" = normalizePath(file.path(
+                    self$get_stan_model_code_path(),
+                    model_file_name
+                )),
+                "data_file" = normalizePath(file.path(
+                    self$get_data_path(),
+                    data_file_name
+                ))
+            )
+        },
+        get_summary_statistic_paths = function(posterior_name, type) {
+            supported <- c("mean_value", "mean_squared_value")
+            checkmate::assert_choice(type, supported)
+            root <- file.path(
+                self$get_pdb_path(), "posterior_database",
+                "reference_posteriors", "summary_statistics", type
+            )
+            list(
+                info = file.path(
+                    root, "info", paste0(posterior_name, ".info.json")
+                ),
+                value = file.path(
+                    root, type, paste0(posterior_name, ".json")
+                )
+            )
+        },
         copy_to_tempdir = function(
             file_path,
             return_obj = TRUE,
@@ -1615,44 +1653,6 @@ PDBEntryBuilder <- R6::R6Class(
                 destination
             }
         },
-        set_stan_file = function(sf) {
-            self$stan_file <- sf
-        },
-        get_stan_file = function() {
-            self$stan_file
-        },
-        set_posterior = function(p) {
-            self$posterior <- p
-        },
-        get_posterior = function() {
-            self$posterior
-        },
-        set_rp = function(rp) {
-            self$rp <- rp
-        },
-        get_rp = function() {
-            self$rp
-        },
-        get_added_by = function() {
-            self$adder
-        },
-        set_added_by = function(added_by) {
-            self$adder <- added_by
-        },
-        refresh = function() {
-            private$pdb <- posteriordb::pdb_local(path = self$path)
-            invisible(self)
-        },
-        get_pdb = function() {
-            private$pdb
-        },
-        get_pdb_path = function() {
-            self$path
-        }
-    ),
-
-    private = list(
-        pdb = NULL,
         search_database_entries = function(
             query,
             directory,
