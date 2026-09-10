@@ -1410,11 +1410,15 @@ PDBEntryBuilder <- R6::R6Class(
         compute_ac = function(x) {
             x <- posterior::as_draws_array(x)
             var_names <- posterior::variables(x)
-            abs(vapply(var_names, function(name) {
-                posterior::autocorrelation(
-                    posterior::extract_variable(x, name)
-                )[2]
-            }, numeric(1)))
+            abs(vapply(
+                var_names,
+                function(name) {
+                    posterior::autocorrelation(
+                        posterior::extract_variable(x, name)
+                    )[2]
+                },
+                numeric(1)
+            ))
         },
         compute_mean_lag1_ac = function(x) {
             checkmate::assert_class(x, "draws")
@@ -1699,30 +1703,40 @@ PDBEntryBuilder <- R6::R6Class(
         },
         search_data = function(query) {
             private$search_database_entries(
-                query, "posterior_database/data/data",
-                "\\.json(?:\\.zip)?$", "data"
+                query,
+                "posterior_database/data/data",
+                "\\.json(?:\\.zip)?$",
+                "data"
             )
         },
         search_data_keywords = function(query) {
             private$search_info_keywords(
-                query, "posterior_database/data/info", "data"
+                query,
+                "posterior_database/data/info",
+                "data"
             )
         },
         search_model = function(query) {
             private$search_database_entries(
-                query, "posterior_database/models/info",
-                "\\.info\\.json$", "model"
+                query,
+                "posterior_database/models/info",
+                "\\.info\\.json$",
+                "model"
             )
         },
         search_model_keywords = function(query) {
             private$search_info_keywords(
-                query, "posterior_database/models/info", "model"
+                query,
+                "posterior_database/models/info",
+                "model"
             )
         },
         search_posterior = function(query) {
             private$search_database_entries(
-                query, "posterior_database/posteriors",
-                "\\.json$", "posterior"
+                query,
+                "posterior_database/posteriors",
+                "\\.json$",
+                "posterior"
             )
         },
         search_reference_draws = function(query) {
@@ -1732,7 +1746,8 @@ PDBEntryBuilder <- R6::R6Class(
                     "posterior_database/reference_posteriors/",
                     "draws/draws"
                 ),
-                "\\.json\\.zip$", "reference-draw"
+                "\\.json\\.zip$",
+                "reference-draw"
             )
         },
         add_bibtex_entry = function(bibtex_str) {
@@ -1747,14 +1762,22 @@ PDBEntryBuilder <- R6::R6Class(
                     x,
                     gregexpr(pattern, x, perl = TRUE, ignore.case = TRUE)
                 )[[1L]]
-                if (identical(matches, character(0))) return(character())
+                if (identical(matches, character(0))) {
+                    return(character())
+                }
                 types <- sub(
-                    pattern, "\\1", matches,
-                    perl = TRUE, ignore.case = TRUE
+                    pattern,
+                    "\\1",
+                    matches,
+                    perl = TRUE,
+                    ignore.case = TRUE
                 )
                 keys <- sub(
-                    pattern, "\\2", matches,
-                    perl = TRUE, ignore.case = TRUE
+                    pattern,
+                    "\\2",
+                    matches,
+                    perl = TRUE,
+                    ignore.case = TRUE
                 )
                 keys[!tolower(types) %in% c("comment", "preamble", "string")]
             }
@@ -1774,7 +1797,8 @@ PDBEntryBuilder <- R6::R6Class(
             }
             if (tolower(new_keys) %in% tolower(extract_keys(existing_text))) {
                 message(
-                    "BibTeX entry `", new_keys,
+                    "BibTeX entry `",
+                    new_keys,
                     "` already exists; nothing was written."
                 )
                 return(invisible(FALSE))
@@ -1853,27 +1877,47 @@ PDBEntryBuilder <- R6::R6Class(
         compute_reference_summary_statistics = function(stan_fit) {
             stan_info <- self$get_reference_info(stan_fit)
             if (is.null(stan_info) || is.null(stan_info$checks_made)) {
-                stop("Draws must be checked before computing summaries.", call. = FALSE)
+                stop(
+                    "Draws must be checked before computing summaries.",
+                    call. = FALSE
+                )
             }
             required_checks <- c(
-                "ndraws_is_10k", "nchains_is_gte_4", "r_hat_below_1_01",
-                "efmi_above_0_2", "abs_mean_lag1_ac_below_0_05"
+                "ndraws_is_10k",
+                "nchains_is_gte_4",
+                "r_hat_below_1_01",
+                "efmi_above_0_2",
+                "abs_mean_lag1_ac_below_0_05"
             )
             failed_checks <- required_checks[
-                !vapply(stan_info$checks_made[required_checks], isTRUE, logical(1))
+                !vapply(
+                    stan_info$checks_made[required_checks],
+                    isTRUE,
+                    logical(1)
+                )
             ]
             if (length(failed_checks) > 0L) {
-                stop("Required checks failed: ", paste(failed_checks, collapse = ", "), call. = FALSE)
+                stop(
+                    "Required checks failed: ",
+                    paste(failed_checks, collapse = ", "),
+                    call. = FALSE
+                )
             }
             draws <- posterior::subset_draws(
                 posterior::as_draws_array(stan_fit),
                 variable = names(self$get_posterior_dims(stan_fit@model_name))
             )
-            mean_summary <- posterior::summarize_draws(draws, "mean", "mcse_mean")
+            mean_summary <- posterior::summarize_draws(
+                draws,
+                "mean",
+                "mcse_mean"
+            )
             squared_draws <- draws
             squared_draws[] <- squared_draws[]^2
             squared_summary <- posterior::summarize_draws(
-                squared_draws, "mean", "mcse_mean"
+                squared_draws,
+                "mean",
+                "mcse_mean"
             )
             list(
                 mean_value = list(
@@ -1889,14 +1933,17 @@ PDBEntryBuilder <- R6::R6Class(
             )
         },
         write_summary_statistics_from_stan_fit = function(
-            stan_fit, overwrite = FALSE, verify = TRUE
+            stan_fit,
+            overwrite = FALSE,
+            verify = TRUE
         ) {
             checkmate::assert_flag(overwrite)
             checkmate::assert_flag(verify)
             summaries <- self$compute_reference_summary_statistics(stan_fit)
             summary_info <- self$get_reference_info(stan_fit)
             summary_info$versions$r_summary_statistic <- paste0(
-                "posterior R package, version ", utils::packageVersion("posterior")
+                "posterior R package, version ",
+                utils::packageVersion("posterior")
             )
             paths <- lapply(names(summaries), function(type) {
                 private$get_summary_statistic_paths(stan_fit@model_name, type)
@@ -1904,28 +1951,58 @@ PDBEntryBuilder <- R6::R6Class(
             names(paths) <- names(summaries)
             destinations <- unlist(paths, use.names = FALSE)
             if (!overwrite && any(file.exists(destinations))) {
-                stop("One or more summary-statistic files already exist.", call. = FALSE)
+                stop(
+                    "One or more summary-statistic files already exist.",
+                    call. = FALSE
+                )
             }
             write_one <- function(x, path) {
-                dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+                dir.create(
+                    dirname(path),
+                    recursive = TRUE,
+                    showWarnings = FALSE
+                )
                 jsonlite::write_json(
-                    x, path, pretty = TRUE, auto_unbox = TRUE,
-                    null = "null", digits = NA
+                    x,
+                    path,
+                    pretty = TRUE,
+                    auto_unbox = TRUE,
+                    null = "null",
+                    digits = NA
                 )
             }
             for (type in names(summaries)) {
                 write_one(summary_info, paths[[type]]$info)
                 write_one(summaries[[type]], paths[[type]]$value)
                 if (verify) {
-                    value <- jsonlite::read_json(paths[[type]]$value, simplifyVector = TRUE)
-                    info <- jsonlite::read_json(paths[[type]]$info, simplifyVector = TRUE)
+                    value <- jsonlite::read_json(
+                        paths[[type]]$value,
+                        simplifyVector = TRUE
+                    )
+                    info <- jsonlite::read_json(
+                        paths[[type]]$info,
+                        simplifyVector = TRUE
+                    )
                     if (
                         !identical(info$name, summary_info$name) ||
                             !identical(value$names, summaries[[type]]$names) ||
-                            !isTRUE(all.equal(value[[type]], summaries[[type]][[type]], check.attributes = FALSE)) ||
-                            !isTRUE(all.equal(value$mcse_mean, summaries[[type]]$mcse_mean, check.attributes = FALSE))
+                            !isTRUE(all.equal(
+                                value[[type]],
+                                summaries[[type]][[type]],
+                                check.attributes = FALSE
+                            )) ||
+                            !isTRUE(all.equal(
+                                value$mcse_mean,
+                                summaries[[type]]$mcse_mean,
+                                check.attributes = FALSE
+                            ))
                     ) {
-                        stop("Summary verification failed for ", type, ".", call. = FALSE)
+                        stop(
+                            "Summary verification failed for ",
+                            type,
+                            ".",
+                            call. = FALSE
+                        )
                     }
                 }
             }
@@ -2022,15 +2099,22 @@ PDBEntryBuilder <- R6::R6Class(
             supported <- c("mean_value", "mean_squared_value")
             checkmate::assert_choice(type, supported)
             root <- file.path(
-                self$get_pdb_path(), "posterior_database",
-                "reference_posteriors", "summary_statistics", type
+                self$get_pdb_path(),
+                "posterior_database",
+                "reference_posteriors",
+                "summary_statistics",
+                type
             )
             list(
                 info = file.path(
-                    root, "info", paste0(posterior_name, ".info.json")
+                    root,
+                    "info",
+                    paste0(posterior_name, ".info.json")
                 ),
                 value = file.path(
-                    root, type, paste0(posterior_name, ".json")
+                    root,
+                    type,
+                    paste0(posterior_name, ".json")
                 )
             )
         },
@@ -2095,20 +2179,27 @@ PDBEntryBuilder <- R6::R6Class(
             search_path <- file.path(self$path, directory)
             if (!dir.exists(search_path)) {
                 stop(
-                    "Could not find the ", entry_type,
-                    " directory: ", search_path,
+                    "Could not find the ",
+                    entry_type,
+                    " directory: ",
+                    search_path,
                     call. = FALSE
                 )
             }
 
             files <- list.files(search_path, full.names = FALSE)
             files <- files[grepl(
-                suffix_pattern, files,
-                ignore.case = TRUE, perl = TRUE
+                suffix_pattern,
+                files,
+                ignore.case = TRUE,
+                perl = TRUE
             )]
             names <- sub(
-                suffix_pattern, "", files,
-                ignore.case = TRUE, perl = TRUE
+                suffix_pattern,
+                "",
+                files,
+                ignore.case = TRUE,
+                perl = TRUE
             )
             matches <- sort(unique(names[
                 grepl(tolower(query), tolower(names), fixed = TRUE)
@@ -2124,8 +2215,10 @@ PDBEntryBuilder <- R6::R6Class(
             search_path <- file.path(self$path, directory)
             if (!dir.exists(search_path)) {
                 stop(
-                    "Could not find the ", entry_type,
-                    " info directory: ", search_path,
+                    "Could not find the ",
+                    entry_type,
+                    " info directory: ",
+                    search_path,
                     call. = FALSE
                 )
             }
@@ -2136,33 +2229,45 @@ PDBEntryBuilder <- R6::R6Class(
                 full.names = TRUE,
                 ignore.case = TRUE
             )
-            matches <- vapply(info_files, function(info_file) {
-                info <- tryCatch(
-                    jsonlite::fromJSON(info_file, simplifyVector = FALSE),
-                    error = function(e) NULL
-                )
-                if (is.null(info)) return(NA_character_)
-                keywords <- as.character(unlist(
-                    info$keywords,
-                    recursive = TRUE,
-                    use.names = FALSE
-                ))
-                if (
-                    length(keywords) == 0L ||
-                        !any(grepl(
-                            tolower(query), tolower(keywords), fixed = TRUE
-                        ))
-                ) {
-                    return(NA_character_)
-                }
-                as.character(info$name)[1L]
-            }, character(1L), USE.NAMES = FALSE)
+            matches <- vapply(
+                info_files,
+                function(info_file) {
+                    info <- tryCatch(
+                        jsonlite::fromJSON(info_file, simplifyVector = FALSE),
+                        error = function(e) NULL
+                    )
+                    if (is.null(info)) {
+                        return(NA_character_)
+                    }
+                    keywords <- as.character(unlist(
+                        info$keywords,
+                        recursive = TRUE,
+                        use.names = FALSE
+                    ))
+                    if (
+                        length(keywords) == 0L ||
+                            !any(grepl(
+                                tolower(query),
+                                tolower(keywords),
+                                fixed = TRUE
+                            ))
+                    ) {
+                        return(NA_character_)
+                    }
+                    as.character(info$name)[1L]
+                },
+                character(1L),
+                USE.NAMES = FALSE
+            )
             matches <- sort(unique(matches[!is.na(matches)]))
 
             if (length(matches) == 0L) {
                 message(
-                    "No ", entry_type,
-                    " keywords matched `", query, "`."
+                    "No ",
+                    entry_type,
+                    " keywords matched `",
+                    query,
+                    "`."
                 )
             }
             matches

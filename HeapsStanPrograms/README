@@ -1,0 +1,10 @@
+The raw data are located in the data directory and R functions to read in and pre-process the data are found in read.R
+
+Illustrative R code to run the Stan programs can be found in run.R
+
+There are five Stan programs:
+* statprior.stan: use to fit a zero-mean, stationary vector autoregressive model of order p, with an exchangeable prior for the partial autocorrelations and the error variance (see Section 3.2 of the manuscript).
+* semiconj.stan: use to fit a zero-mean vector autoregressive model of order p, with a semi-conjugate prior for the autoregressive coefficients and the error variance (see Section 5 of the manuscript).
+* statrmlprior.stan: use to fit a zero-mean, stationary vector autoregressive model of order p, with a "vague" prior based on the reparameterisation of Roy et al. (2019) (see Section 3.5 of the manuscript and Section S3 of the Supplementary Materials). This requires version 2.26 (or later) of Stan.
+* statinvertprior.stan: use to fit a zero-mean, stationary and invertible vector autoregressive moving average model of order (p, q) with an exchangeable prior for the partial autocorrelation and inverse partial autocorrelation parameters and the error variance (see Section 6 of the manuscript and Section S7 of the Supplementary Materials).
+* ansleykohn.stan: for a zero-mean, stationary vector autoregressive model of order p under the partial autocorrelation reparameterisation of Ansley and Kohn (1986). This uses Cholesky decompositions, rather than symmetric matrix-square-roots, in both parts of the reparameterisation. The programme can be used for frequentist inference via (numerical) maximum likelihood (see Section 5 of the manuscript). It could also be used for Bayesian inference if a uniform prior is assumed for all elements in the parameters block.
