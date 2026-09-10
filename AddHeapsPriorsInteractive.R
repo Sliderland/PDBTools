@@ -1,8 +1,8 @@
 # Add Heaps VAR posteriors in computationally staged groups.
 #
 # Work classes:
-# - easy: 3- and 10-variable VARs, excluding statinvert_varma
-# - hard: every statinvert_varma model and every 20-variable model
+# - easy: 3- and 10-variable VARs, excluding statinvert_varma and ansleykohn_var
+# - hard: every statinvert_varma or ansleykohn_var and every 20-variable model
 #
 # `workflow_mode` controls which group is considered:
 # - "easy": run only easy jobs; never prompt for hard jobs
@@ -33,20 +33,21 @@ continue_on_error <- TRUE
 pdb_path <- path.expand("~/Documents/posteriordb")
 heaps_program_path <- normalizePath("HeapsStanPrograms", mustWork = TRUE)
 
-# Four chains and no thinning retain exactly 10,000 post-warmup draws while
-# computing 14,000 rather than 300,000 total HMC transitions.
+# Reference sampling deliberately uses long, thinned chains. This retains
+# exactly 10,000 low-autocorrelation draws across 10 independent chains and
+# supports reliable between-chain convergence diagnostics.
 easy_sampling_args <- list(
-    chains = 4L,
-    iter = 3500L,
-    warmup = 1000L,
-    thin = 1L,
-    refresh = 500L,
+    chains = 10L,
+    iter = 30000L,
+    warmup = 10000L,
+    thin = 20L,
+    refresh = 1000L,
     seed = 123L,
-    control = list(adapt_delta = 0.9)
+    control = list(adapt_delta = 0.95)
 )
 
-# Hard jobs use the same efficient baseline. Increase adapt_delta for a
-# particular retry only when its diagnostics show divergences.
+# Hard jobs must meet the same reference-draw quality requirements. They are
+# separated because their wall time or known sampling pathologies need review.
 hard_sampling_args <- easy_sampling_args
 
 workflow_mode <- match.arg(workflow_mode, c("easy", "hard", "all"))
@@ -243,7 +244,7 @@ for (dataset_key in names(dataset_definitions)) {
             paste0("heaps_", dataset_key, "_", model_name)
         }
         posterior_name <- paste(data_name, model_name, sep = "-")
-        is_hard <- identical(model_name, "statinvert_varma") ||
+        is_hard <- model_name %in% c("statinvert_varma", "ansleykohn_var") ||
             identical(dataset_key, "med20")
 
         workflow_entries[[posterior_name]] <- list(
@@ -384,11 +385,18 @@ run_workflow_group <- function(entries, sampling_args, label) {
     registration <- register_workflow_entries(entries)
 
     sampling_entries <- lapply(entries, function(spec) {
+        model_sampling_args <- sampling_args
+        if (identical(spec$model_name, "statrml_var")) {
+            model_sampling_args$control <- list(
+                adapt_delta = 0.99,
+                max_treedepth = 15L
+            )
+        }
         list(
             posterior_name = spec$posterior_name,
             posterior = spec$posterior[c("data_name", "model_name")],
             reference = list(
-                sampling_args = sampling_args,
+                sampling_args = model_sampling_args,
                 comments = paste("Staged reference sampling for", spec$posterior_name)
             )
         )
