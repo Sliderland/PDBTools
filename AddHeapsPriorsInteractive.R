@@ -17,7 +17,7 @@ source(file.path("HeapsStanPrograms", "read.R"))
 
 # User controls -----------------------------------------------------------
 
-workflow_mode <- "all"
+workflow_mode <- "easy"
 
 # NULL prompts interactively. Set TRUE to approve hard jobs without a prompt,
 # or FALSE to decline them without a prompt (useful for non-interactive runs).
@@ -25,7 +25,7 @@ hard_confirmation <- NULL
 
 register_entries <- TRUE
 write_reference_files <- TRUE
-overwrite_registration <- TRUE
+overwrite_registration <- FALSE
 overwrite_reference_files <- FALSE
 skip_completed_references <- TRUE
 continue_on_error <- TRUE
