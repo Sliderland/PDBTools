@@ -264,7 +264,10 @@ extract_saved_vecm_draws <- function(archive, model_name,
     } else {
         "xi"
     }
-    required <- c("alpha", "beta", short_run_name, "L", "mu")
+    required <- c(
+        "alpha", "beta", short_run_name, "L", "mu",
+        if (has_variable("phi")) "phi"
+    )
     missing <- required[!vapply(required, has_variable, logical(1))]
     if (length(missing)) {
         stop(
@@ -314,9 +317,7 @@ extract_saved_vecm_draws <- function(archive, model_name,
         model_name = model_name
     )
     if (has_variable("phi")) {
-        phi_draws <- posterior::subset_draws(draws, variable = "phi")
-        phi_rvar <- posterior::as_draws_rvars(phi_draws)$phi
-        result$exogenous_draws <- flatten_rvar(phi_rvar)
+        result$exogenous_draws <- flatten_rvar(rvars$phi)
     }
     if (model_name %in% c("vecm_long_run", "vecm_urca_hmc")) {
         extra_note <- if (identical(model_name, "vecm_urca_hmc")) {
