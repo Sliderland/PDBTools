@@ -31,9 +31,9 @@ local({
     } else {
         file.path(dirname(normalizePath(caller_file)), "VECMPosteriorDiagnostics.R")
     }
-    if (!exists("extract_saved_vecm_draws", mode = "function")) {
-        source(source_path)
-    }
+    # Always refresh the companion functions. An older definition may already
+    # be present in an interactive R session, including one that drops `phi`.
+    source(source_path)
 })
 
 default_vecm_archive_path <- function() {
