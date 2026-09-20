@@ -2,8 +2,9 @@ functions {
   /* Function to compute the matrix square root */
   matrix sqrtm(matrix A) {
     int m = rows(A);
+    // Use the principal symmetric square root. The extra square root in
+    // `root_root_evals` is required because `tcrossprod` squares the factors.
     matrix[m, m] A_sym = 0.5 * (A + A');
-    
     vector[m] root_root_evals = sqrt(sqrt(eigenvalues_sym(A_sym)));
     matrix[m, m] evecs = eigenvectors_sym(A_sym);
     matrix[m, m] eprod = diag_post_multiply(evecs, root_root_evals);
