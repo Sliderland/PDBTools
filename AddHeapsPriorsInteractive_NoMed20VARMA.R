@@ -30,6 +30,14 @@ hard_confirmation <- TRUE
 # Set this to FALSE to restore the original complete workflow.
 skip_med20_statinvert_varma <- TRUE
 
+# Skip workflows previously found to have severe sampling or numerical
+# problems. Set this to FALSE to include them again.
+skip_known_problematic_workflows <- TRUE
+known_problematic_workflows <- c(
+  "heaps_small3_statinvert_varma-statinvert_varma",
+  "heaps_med10_statinvert_varma-statinvert_varma"
+)
+
 register_entries <- FALSE
 write_reference_files <- TRUE
 overwrite_registration <- FALSE
@@ -348,6 +356,23 @@ if (skip_med20_statinvert_varma) {
     message(
       "Excluded expensive workflow(s): ",
       paste(excluded_names, collapse = ", ")
+    )
+  }
+}
+
+if (skip_known_problematic_workflows) {
+  excluded <- intersect(
+    names(workflow_entries),
+    known_problematic_workflows
+  )
+  if (length(excluded) > 0L) {
+    workflow_entries <- workflow_entries[setdiff(
+      names(workflow_entries),
+      excluded
+    )]
+    message(
+      "Excluded known problematic workflow(s): ",
+      paste(excluded, collapse = ", ")
     )
   }
 }
