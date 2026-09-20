@@ -10,24 +10,6 @@ functions {
     matrix[m, m] eprod = diag_post_multiply(evecs, root_root_evals);
     return tcrossprod(eprod);
   }
-  /* Function to compute Kronecker product */
-  matrix kronecker_prod(matrix A, matrix B) {
-    matrix[rows(A) * rows(B), cols(A) * cols(B)] C;
-    int m = rows(A);
-    int n = cols(A);
-    int p = rows(B);
-    int q = cols(B);
-    for (i in 1 : m) {
-      for (j in 1 : n) {
-        int row_start = (i - 1) * p + 1;
-        int row_end = (i - 1) * p + p;
-        int col_start = (j - 1) * q + 1;
-        int col_end = (j - 1) * q + q;
-        C[row_start : row_end, col_start : col_end] = A[i, j] * B;
-      }
-    }
-    return C;
-  }
   /* Function to transform A to P (inverse of part 2 of reparameterisation) */
   matrix AtoP(matrix A) {
     int m = rows(A);
@@ -97,21 +79,13 @@ functions {
     int p = size(phi);
     int q = size(theta);
     int m = rows(Sigma);
+    int state_dim = (p + q) * m;
     matrix[(p + q) * m, (p + q) * m] companion_mat = rep_matrix(0.0,
                                                                 (p + q) * m,
                                                                 (p + q) * m);
     matrix[(p + q) * m, (p + q) * m] companion_var = rep_matrix(0.0,
                                                                 (p + q) * m,
                                                                 (p + q) * m);
-    matrix[(p + q) * m * (p + q) * m, (p + q) * m * (p + q) * m] tmp = diag_matrix(rep_vector(
-                                                                    1.0,
-                                                                    (
-                                                                    p + q)
-                                                                    * m
-                                                                    * (
-                                                                    p + q)
-                                                                    * m));
-    matrix[(p + q) * m, (p + q) * m] Omega;
     // Construct phi_tilde:
     for (i in 1 : p) {
       companion_mat[1 : m, ((i - 1) * m + 1) : (i * m)] = phi[i];
@@ -136,16 +110,27 @@ functions {
     companion_var[(p * m + 1) : ((p + 1) * m), (p * m + 1) : ((p + 1) * m)] = Sigma;
     companion_var[1 : m, (p * m + 1) : ((p + 1) * m)] = Sigma;
     companion_var[(p * m + 1) : ((p + 1) * m), 1 : m] = Sigma;
-    // Compute Gamma0_tilde
-    tmp -= kronecker_prod(companion_mat, companion_mat);
-    Omega = to_matrix(tmp \ to_vector(companion_var), (p + q) * m,
-                      (p + q) * m);
-    // Ensure Omega is symmetric:
-    for (i in 1 : (rows(Omega) - 1)) {
-      for (j in (i + 1) : rows(Omega)) {
-        Omega[j, i] = Omega[i, j];
-      }
+    // Compute Gamma0_tilde from the discrete Lyapunov equation
+    //
+    //   Omega = companion_mat * Omega * companion_mat' + companion_var.
+    //
+    // The old implementation solved this equation through
+    // I - kron(companion_mat, companion_mat), whose dimension is
+    // state_dim^2 by state_dim^2. The doubling recursion below computes the
+    // same covariance series without constructing that Kronecker system:
+    // after each step, Omega contains twice as many terms and companion_mat
+    // is squared. A fixed number of steps keeps the computation smooth with
+    // respect to the model parameters.
+    matrix[state_dim, state_dim] transition = companion_mat;
+    matrix[state_dim, state_dim] Omega = companion_var;
+    int lyapunov_steps = 30;
+    for (step in 1 : lyapunov_steps) {
+      Omega = Omega + transition * Omega * transition';
+      transition = transition * transition;
     }
+    // Keep the numerical result exactly symmetric before the covariance
+    // constraint and multivariate-normal density evaluate it.
+    Omega = 0.5 * (Omega + Omega');
     return Omega;
   }
 }
@@ -308,4 +293,3 @@ generated quantities {
   vector[m * p] lambda_moduli = abs(lambdas);
   real max_lambda_modulus = max(lambda_moduli);
 }
-
