@@ -35,7 +35,8 @@ skip_med20_statinvert_varma <- TRUE
 skip_known_problematic_workflows <- TRUE
 known_problematic_workflows <- c(
   "heaps_small3_statinvert_varma-statinvert_varma",
-  "heaps_med10_statinvert_varma-statinvert_varma"
+  "heaps_med10_statinvert_varma-statinvert_varma",
+  "heaps_med10_statrml_var-statrml_var"
 )
 
 register_entries <- FALSE
