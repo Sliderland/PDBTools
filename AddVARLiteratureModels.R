@@ -33,6 +33,16 @@ overwrite_reference_files <- FALSE
 skip_completed_references <- TRUE
 continue_on_error <- TRUE
 
+# Retain completed but non-passing rstanfit objects outside PosteriorDB for
+# later diagnostics. These files can be large; leave disabled unless needed.
+save_failed_fits <- FALSE
+failed_fit_dir <- file.path(
+    path.expand("~"),
+    "Documents",
+    "PDBTools_diagnostics",
+    "failed_reference_fits"
+)
+
 dataset_sizes_to_run <- c("small3", "med10")
 models_to_run <- c(
     "unconstrained_var",
@@ -45,8 +55,8 @@ models_to_run <- c(
 # Optional after repairing the current Stan sources.  They remain fully
 # described below so they can be enabled without changing the batch logic.
 # - VAR_SV currently assigns a Beta prior to a parameter with support [-1, 1].
-# - VECM_URCA_test currently needs prior/orientation and zero-exogenous-column
-#   checks before it is suitable for a reference posterior.
+# - VECM_URCA_test still has flat priors on mu, alpha, and phi and needs
+#   data-specific validation before reference sampling.
 # models_to_run <- c(models_to_run, "var_sv", "vecm_urca")
 
 var_lag <- 4L
@@ -122,8 +132,9 @@ model_definitions <- list(
         keywords = c("VECM", "cointegration", "VAR", "error correction"),
         references = "johansen1995likelihood",
         parameters_exclude = c(
-            "A", "inLevelsTop", "inLevelsCompanion", "lambdas",
-            "lambda_moduli", "max_lambda_modulus"
+            "A", "topblock", "ect", "short_run", "inLevelsTop",
+            "inLevelsCompanion", "lambdas", "lambda_moduli",
+            "max_lambda_modulus"
         )
     ),
     vecm_long_run = list(
@@ -137,8 +148,9 @@ model_definitions <- list(
         keywords = c("VECM", "cointegration", "long-run", "VAR"),
         references = "johansen1995likelihood",
         parameters_exclude = c(
-            "A", "inLevelsTop", "inLevelsCompanion", "lambdas",
-            "lambda_moduli", "max_lambda_modulus"
+            "A", "topblock", "ect", "short_run", "inLevelsTop",
+            "inLevelsCompanion", "lambdas", "lambda_moduli",
+            "max_lambda_modulus"
         )
     ),
     vecm_urca = list(
@@ -152,8 +164,9 @@ model_definitions <- list(
         keywords = c("VECM", "cointegration", "seasonality", "exogenous", "VAR"),
         references = "johansen1995likelihood",
         parameters_exclude = c(
-            "A", "inLevelsTop", "inLevelsCompanion", "lambdas",
-            "lambda_moduli", "max_lambda_modulus"
+            "A", "topblock", "ect", "short_run", "inLevelsTop",
+            "inLevelsCompanion", "lambdas", "lambda_moduli",
+            "max_lambda_modulus"
         )
     )
 )
@@ -223,12 +236,6 @@ if (any(missing_stan)) {
     )
 }
 
-heaps_read <- file.path(source_model_root, "HeapsStanPrograms", "read.R")
-if (!file.exists(heaps_read)) {
-    stop("Missing Heaps data reader: ", heaps_read)
-}
-source(heaps_read)
-
 dataset_definitions <- list(
     small3 = list(dimension = 3L, size = "Small"),
     med10 = list(dimension = 10L, size = "Medium"),
@@ -240,14 +247,26 @@ if (length(unknown_sizes)) {
 }
 dataset_definitions <- dataset_definitions[dataset_sizes_to_run]
 
-heaps_y <- lapply(dataset_definitions, function(x) {
-    process_data(
-        num = x$dimension,
-        omit = c(1:2, 197:200),
-        Nahead = 40,
-        data_dir_path = file.path(source_model_root, "HeapsStanPrograms", "data")
-    )$y
-})
+var_model_names <- c(
+    "unconstrained_var", "minnesota_var", "horseshoe_var", "var_sv"
+)
+selected_var_models <- intersect(var_model_names, names(model_definitions))
+heaps_y <- list()
+if (length(selected_var_models)) {
+    heaps_read <- file.path(source_model_root, "HeapsStanPrograms", "read.R")
+    if (!file.exists(heaps_read)) {
+        stop("Missing Heaps data reader: ", heaps_read)
+    }
+    source(heaps_read)
+    heaps_y <- lapply(dataset_definitions, function(x) {
+        process_data(
+            num = x$dimension,
+            omit = c(1:2, 197:200),
+            Nahead = 40,
+            data_dir_path = file.path(source_model_root, "HeapsStanPrograms", "data")
+        )$y
+    })
+}
 
 build_var_data <- function(model_name, y) {
     n <- ncol(y)
@@ -282,13 +301,11 @@ make_data_info <- function(name, title, description, keywords, references) {
 }
 
 data_entries <- list()
-for (dataset_key in names(dataset_definitions)) {
+for (dataset_key in names(heaps_y)) {
     y <- heaps_y[[dataset_key]]
     dataset_meta <- dataset_definitions[[dataset_key]]
     for (model_name in names(model_definitions)) {
-        if (!model_name %in% c(
-            "unconstrained_var", "minnesota_var", "horseshoe_var", "var_sv"
-        )) next
+        if (!model_name %in% var_model_names) next
         name <- paste("var_literature", dataset_key, model_name, sep = "_")
         data_entries[[name]] <- list(
             model_name = model_name,
@@ -308,55 +325,65 @@ for (dataset_key in names(dataset_definitions)) {
     }
 }
 
-vecm_archive_path <- file.path(getwd(), "recovered_vecm_data.rds")
-if (any(grepl("^vecm_", names(model_definitions)))) {
-    if (!file.exists(vecm_archive_path)) {
-        stop("VECM models selected but archive is missing: ", vecm_archive_path)
+selected_vecm_models <- intersect(
+    c("vecm_priors", "vecm_long_run"),
+    names(model_definitions)
+)
+shared_vecm_data_name <- NULL
+if (length(selected_vecm_models)) {
+    source("VECMSyntheticData.R")
+    vecm_simulation <- generate_vecm_synthetic_data()
+    vecm_base <- vecm_simulation$stan_data
+    if (vecm_base$p != var_lag || vecm_base$h != vecm_rank) {
+        stop("The VECM generator and selected lag/rank settings disagree.")
     }
-    vecm_archive <- readRDS(vecm_archive_path)
-    synthetic_y <- vecm_archive$data$vecm_priors
-    denmark_data <- vecm_archive$stan_data$vecm_urca_hmc
-
-    vecm_base <- list(
-        t = nrow(synthetic_y), N = ncol(synthetic_y), p = var_lag,
-        h = vecm_rank, y = synthetic_y
+    shared_vecm_data_name <- "vecm_synthetic5_rank2_p4_v1"
+    data_entries[[shared_vecm_data_name]] <- list(
+        model_name = selected_vecm_models[[1L]],
+        data = vecm_base,
+        info = make_data_info(
+            shared_vecm_data_name,
+            "Five-variable rank-two synthetic cointegrated series",
+            paste(
+                vecm_base$t,
+                "observations from a Gaussian VECM(4) with rank two,",
+                "three common stochastic trends, correlated innovations,",
+                "and seed 20260917. The first four rows are fixed",
+                "conditioning values. Reproduce with VECMSyntheticData.R."
+            ),
+            c("VECM", "cointegration", "synthetic", "rank 2"),
+            "johansen1995likelihood"
+        )
     )
-    for (model_name in names(model_definitions)) {
-        if (!model_name %in% c("vecm_priors", "vecm_long_run")) next
-        name <- paste("vecm_synthetic", model_name, sep = "_")
-        data_entries[[name]] <- list(
-            model_name = model_name,
-            data = vecm_base,
-            info = make_data_info(
-                name,
-                paste("Synthetic five-variable data for", model_name),
-                paste(
-                    "Synthetic five-variable cointegrated series used to",
-                    "compare Bayesian transitory and long-run VECM formulations."
-                ),
-                c("VECM", "cointegration", "synthetic", model_name),
-                "johansen1995likelihood"
-            )
-        )
-    }
+    message(
+        "Synthetic VECM checks: rank=", vecm_simulation$checks$rank,
+        ", unit roots=", vecm_simulation$checks$unit_root_count,
+        ", max other root=",
+        signif(vecm_simulation$checks$max_other_root_modulus, 4)
+    )
+}
 
-    if ("vecm_urca" %in% names(model_definitions)) {
-        name <- "vecm_denmark_seasonal_vecm_urca"
-        data_entries[[name]] <- list(
-            model_name = "vecm_urca",
-            data = denmark_data,
-            info = make_data_info(
-                name,
-                "Denmark data with seasonal regressors for the exogenous VECM",
-                paste(
-                    "Five-variable Denmark data with centered quarterly seasonal",
-                    "dummies and the data fields required by the exogenous VECM."
-                ),
-                c("VECM", "cointegration", "Denmark", "seasonality", "exogenous"),
-                "johansen1995likelihood"
-            )
-        )
+if ("vecm_urca" %in% names(model_definitions)) {
+    vecm_archive_path <- file.path(getwd(), "recovered_vecm_data.rds")
+    if (!file.exists(vecm_archive_path)) {
+        stop("The optional URCA VECM archive is missing: ", vecm_archive_path)
     }
+    denmark_data <- readRDS(vecm_archive_path)$stan_data$vecm_urca_hmc
+    name <- "vecm_denmark_seasonal_vecm_urca"
+    data_entries[[name]] <- list(
+        model_name = "vecm_urca",
+        data = denmark_data,
+        info = make_data_info(
+            name,
+            "Denmark data with seasonal regressors for the exogenous VECM",
+            paste(
+                "Five-variable Denmark data with centered quarterly seasonal",
+                "dummies and the data fields required by the exogenous VECM."
+            ),
+            c("VECM", "cointegration", "Denmark", "seasonality", "exogenous"),
+            "johansen1995likelihood"
+        )
+    )
 }
 
 plan <- data.frame(
@@ -364,6 +391,20 @@ plan <- data.frame(
     model_name = vapply(data_entries, function(x) x$model_name, character(1)),
     stringsAsFactors = FALSE
 )
+if (length(selected_vecm_models) > 1L) {
+    plan <- rbind(
+        plan,
+        data.frame(
+            data_name = rep(
+                shared_vecm_data_name,
+                length(selected_vecm_models) - 1L
+            ),
+            model_name = selected_vecm_models[-1L],
+            stringsAsFactors = FALSE
+        )
+    )
+}
+rownames(plan) <- NULL
 plan$posterior_name <- paste(plan$data_name, plan$model_name, sep = "-")
 print(plan)
 
@@ -498,7 +539,9 @@ if (!preflight_only) {
                 sample = TRUE,
                 write = write_reference_files,
                 overwrite = overwrite_reference_files,
-                continue_on_error = continue_on_error
+                continue_on_error = continue_on_error,
+                save_failed_fits = save_failed_fits,
+                failed_fit_dir = failed_fit_dir
             )
             print(entry$summarize_workflow_results(results))
         }

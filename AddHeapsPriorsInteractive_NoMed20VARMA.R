@@ -46,6 +46,13 @@ overwrite_reference_files <- FALSE
 skip_completed_references <- TRUE
 continue_on_error <- TRUE
 
+# Retain completed but non-passing rstanfit objects outside PosteriorDB for
+# later diagnostics. These files can be large; leave disabled unless needed.
+save_failed_fits <- FALSE
+failed_fit_dir <- path.expand(
+  "~/Documents/PDBTools_diagnostics/failed_reference_fits"
+)
+
 pdb_path <- path.expand("~/Documents/posteriordb")
 heaps_program_path <- normalizePath("HeapsStanPrograms", mustWork = TRUE)
 
@@ -523,7 +530,9 @@ run_workflow_group <- function(entries, sampling_args, label) {
     sample = TRUE,
     write = write_reference_files,
     overwrite = overwrite_reference_files,
-    continue_on_error = continue_on_error
+    continue_on_error = continue_on_error,
+    save_failed_fits = save_failed_fits,
+    failed_fit_dir = failed_fit_dir
   )
   summary <- entry$summarize_workflow_results(sampling)
   print(summary)

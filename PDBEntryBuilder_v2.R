@@ -1935,6 +1935,17 @@ PDBEntryBuilder <- R6::R6Class(
                     function(x) x$written,
                     logical(1)
                 ),
+                failed_fit_path = vapply(
+                    results,
+                    function(x) {
+                        if (is.null(x$failed_fit_path)) {
+                            NA_character_
+                        } else {
+                            x$failed_fit_path
+                        }
+                    },
+                    character(1)
+                ),
                 error = vapply(
                     results,
                     function(x) {
