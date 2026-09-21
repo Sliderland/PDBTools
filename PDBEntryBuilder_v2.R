@@ -1401,20 +1401,112 @@ PDBEntryBuilder <- R6::R6Class(
             sample = TRUE,
             write = FALSE,
             overwrite = FALSE,
-            continue_on_error = TRUE
+            continue_on_error = TRUE,
+            save_failed_fits = FALSE,
+            failed_fit_dir = NULL
         ) {
             flags <- list(
                 register = register,
                 sample = sample,
                 write = write,
                 overwrite = overwrite,
-                continue_on_error = continue_on_error
+                continue_on_error = continue_on_error,
+                save_failed_fits = save_failed_fits
             )
             for (flag_name in names(flags)) {
                 checkmate::assert_flag(flags[[flag_name]])
             }
             if (write && !sample) {
                 stop("`write = TRUE` requires `sample = TRUE`.", call. = FALSE)
+            }
+            if (save_failed_fits) {
+                if (
+                    is.null(failed_fit_dir) ||
+                        !is.character(failed_fit_dir) ||
+                        length(failed_fit_dir) != 1L ||
+                        is.na(failed_fit_dir) ||
+                        !nzchar(failed_fit_dir)
+                ) {
+                    stop(
+                        "`failed_fit_dir` must be a non-empty path when `save_failed_fits = TRUE`.",
+                        call. = FALSE
+                    )
+                }
+                dir.create(
+                    failed_fit_dir,
+                    recursive = TRUE,
+                    showWarnings = FALSE
+                )
+                if (!dir.exists(failed_fit_dir)) {
+                    stop(
+                        "Could not create `failed_fit_dir`.",
+                        call. = FALSE
+                    )
+                }
+            }
+
+            save_failed_fit <- function(fit, posterior_name, reason) {
+                if (!save_failed_fits || !inherits(fit, "stanfit")) {
+                    return(NULL)
+                }
+
+                safe_name <- gsub(
+                    "[^A-Za-z0-9_.-]",
+                    "_",
+                    posterior_name
+                )
+                stamp <- format(
+                    Sys.time(),
+                    "%Y%m%d_%H%M%S"
+                )
+                prefix <- file.path(
+                    failed_fit_dir,
+                    paste0(
+                        safe_name,
+                        "_",
+                        stamp,
+                        "_pid",
+                        Sys.getpid()
+                    )
+                )
+                fit_path <- paste0(prefix, ".rds")
+                diagnostic_path <- paste0(prefix, ".diagnostics.rds")
+
+                saved <- tryCatch(
+                    {
+                        saveRDS(fit, fit_path, compress = "gzip")
+                        saveRDS(
+                            list(
+                                posterior_name = posterior_name,
+                                saved_at = Sys.time(),
+                                reason = reason,
+                                reference_info = self$get_reference_info(fit)
+                            ),
+                            diagnostic_path,
+                            compress = "gzip"
+                        )
+                        message(
+                            "Saved failed fit for ",
+                            posterior_name,
+                            " to ",
+                            fit_path
+                        )
+                        fit_path
+                    },
+                    error = function(e) {
+                        warning(
+                            paste0(
+                                "Could not save failed fit for ",
+                                posterior_name,
+                                ": ",
+                                conditionMessage(e)
+                            ),
+                            call. = FALSE
+                        )
+                        NULL
+                    }
+                )
+                saved
             }
             if (!is.list(entries) || length(entries) == 0L) {
                 stop("`entries` must be a non-empty list.", call. = FALSE)
@@ -1478,6 +1570,7 @@ PDBEntryBuilder <- R6::R6Class(
                 spec <- entries[[i]]
                 fit <- NULL
                 posterior_object <- NULL
+                posterior_name <- entry_name
 
                 message(
                     "Starting workflow ",
@@ -1592,6 +1685,7 @@ PDBEntryBuilder <- R6::R6Class(
                         info_path <- NULL
                         draws_path <- NULL
                         summary_paths <- NULL
+                        failed_fit_path <- NULL
 
                         if (sample) {
                             if (
@@ -1684,6 +1778,19 @@ PDBEntryBuilder <- R6::R6Class(
                                 )
                             }
 
+                            if (length(failed_required_checks) > 0L) {
+                                failed_fit_path <- save_failed_fit(
+                                    fit,
+                                    posterior_name,
+                                    list(
+                                        status = "failed_checks",
+                                        failed_checks = failed_checks,
+                                        failed_required_checks = failed_required_checks,
+                                        total_divergences = total_divergences
+                                    )
+                                )
+                            }
+
                             if (length(failed_required_checks) == 0L) {
                                 fit <- self$check_draws_from_stanfit(fit)
                                 if (write) {
@@ -1736,10 +1843,19 @@ PDBEntryBuilder <- R6::R6Class(
                             info_path = info_path,
                             draws_path = draws_path,
                             summary_paths = summary_paths,
+                            failed_fit_path = failed_fit_path,
                             error = NULL
                         )
                     },
                     error = function(e) {
+                        failed_fit_path <- save_failed_fit(
+                            fit,
+                            if (is.null(posterior_name)) entry_name else posterior_name,
+                            list(
+                                status = "error",
+                                error = conditionMessage(e)
+                            )
+                        )
                         message(entry_name, " failed: ", conditionMessage(e))
                         list(
                             name = entry_name,
@@ -1758,6 +1874,7 @@ PDBEntryBuilder <- R6::R6Class(
                             info_path = NULL,
                             draws_path = NULL,
                             summary_paths = NULL,
+                            failed_fit_path = failed_fit_path,
                             error = conditionMessage(e)
                         )
                     }
