@@ -25,8 +25,8 @@ register_entries <- TRUE
 run_sampling <- TRUE
 write_reference_files <- TRUE
 
-overwrite_registration <- TRUE
-overwrite_reference_files <- FALSE
+overwrite_registration <- FALSE
+overwrite_reference_files <- TRUE
 skip_completed_references <- TRUE
 continue_on_error <- TRUE
 
@@ -39,14 +39,22 @@ failed_fit_dir <- path.expand(
 
 # Run the small and medium-dimensional datasets. Add "med20" back for the
 # substantially longer large-dimensional jobs.
-dataset_sizes_to_run <- c("small3", "med10")
+dataset_sizes_to_run <- c("small3", "med10", "med20")
+#models_to_run <- c(
+#  "statprior_var",
+#  "semiconj_var",
+#  "statrml_var",
+#  "statinvert_varma",
+#  "ansleykohn_var"
+#)
+
 models_to_run <- c(
-  "statprior_var",
-  "semiconj_var",
-  "statrml_var",
-  "statinvert_varma",
-  "ansleykohn_var"
-)
+    "statprior_var",
+    "semiconj_var",
+    "statrml_var",
+    "ansleykohn_var"
+  )
+
 
 if (write_reference_files && !run_sampling) {
   stop("`write_reference_files = TRUE` requires `run_sampling = TRUE`.")
@@ -58,7 +66,8 @@ entry <- PDBEntryBuilder$new(pdb_path)
 
 heaps_reference <- paste(
   "@article{heaps2023stationary,",
-  "  title = {Enforcing {Stationarity} through the {Prior} in {Vector} {Autoregressions}},",
+  "  title = {Enforcing {Stationarity} through the",
+  " {Prior} in {Vector} {Autoregressions}},",
   "  author = {Heaps, Sarah E.},",
   "  journal = {Journal of Computational and Graphical Statistics},",
   "  year = {2023},",

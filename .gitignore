@@ -10,6 +10,7 @@ HeapsStanPrograms/*.rds
 # User-specific files
 .Ruserdata
 .lintr
+.zed/
 
 # Example code in package build process
 *-Ex.R
@@ -49,3 +50,8 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+*.rds
+*.RDS
+
+*.csv

@@ -108,7 +108,7 @@ transformed data {
   real scale_diag;
   real scale_offdiag;
   real df;
-
+  
   es = rep_vector(0.0, 2);
   fs = rep_vector(sqrt(0.455), 2);
   gs = rep_vector(1.365, 2);
@@ -207,4 +207,3 @@ generated quantities {
   vector[m * p] lambda_moduli = abs(lambdas);
   real max_lambda_modulus = max(lambda_moduli);
 }
-
