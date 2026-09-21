@@ -1,3 +1,673 @@
+# The PosteriorDB name is part of the database graph, not just a filename.
+# These helpers stage a complete rename before changing any source files.
+
+pdbtools_rename_validate_name <- function(name) {
+    if (!is.character(name) || length(name) != 1L || is.na(name) || !nzchar(name)) {
+        stop("Names must be non-empty character strings.", call. = FALSE)
+    }
+    if (
+        grepl("[/\\\\]", name) ||
+            name %in% c(".", "..") ||
+            grepl("[[:cntrl:]]", name)
+    ) {
+        stop(
+            "Names must be single path components without separators or control characters.",
+            call. = FALSE
+        )
+    }
+    invisible(name)
+}
+
+pdbtools_rename_relpath <- function(root, path) {
+    path <- gsub("\\\\", "/", path)
+    if (
+        !nzchar(path) ||
+            grepl("^[/]", path) ||
+            grepl("(^|/)[.][.](/|$)", path)
+    ) {
+        stop("PosteriorDB paths must be relative and cannot contain '..'.", call. = FALSE)
+    }
+    file.path(root, path)
+}
+
+pdbtools_rename_read_json <- function(path) {
+    tryCatch(
+        jsonlite::read_json(path, simplifyVector = FALSE),
+        error = function(e) {
+            stop(
+                "Cannot parse JSON file '",
+                path,
+                "': ",
+                conditionMessage(e),
+                call. = FALSE
+            )
+        }
+    )
+}
+
+pdbtools_rename_json_text <- function(object) {
+    out <- jsonlite::toJSON(
+        object,
+        pretty = TRUE,
+        auto_unbox = TRUE,
+        null = "null",
+        digits = NA,
+        encoding = "UTF-8"
+    )
+    Encoding(out) <- "UTF-8"
+    as.character(out)
+}
+
+pdbtools_rename_model_path <- function(value, old_name, new_name) {
+    if (!is.character(value) || length(value) != 1L || is.na(value)) {
+        return(value)
+    }
+    value <- gsub("\\\\", "/", value)
+    if (!startsWith(value, "models/") ||
+        !startsWith(basename(value), paste0(old_name, "."))) {
+        return(value)
+    }
+    paste0(
+        dirname(value),
+        "/",
+        new_name,
+        substring(basename(value), nchar(old_name) + 1L)
+    )
+}
+
+pdbtools_rename_add_action <- function(
+    actions,
+    source,
+    target,
+    content = NULL,
+    zip_member = NULL
+) {
+    source <- gsub("\\\\", "/", source)
+    target <- gsub("\\\\", "/", target)
+    previous <- actions[[source]]
+    if (!is.null(previous)) {
+        same_content <-
+            (is.null(previous$content) && is.null(content)) ||
+                identical(previous$content, content)
+        if (
+            !identical(previous$target, target) ||
+                !same_content ||
+                !identical(previous$zip_member, zip_member)
+        ) {
+            stop(
+                "The rename plan contains conflicting actions for '",
+                source,
+                "'.",
+                call. = FALSE
+            )
+        }
+        return(actions)
+    }
+    actions[[source]] <- list(
+        source = source,
+        target = target,
+        content = content,
+        zip_member = zip_member
+    )
+    actions
+}
+
+pdbtools_rename_stage_zip <- function(source, destination, member_name) {
+    listing <- tryCatch(
+        utils::unzip(source, list = TRUE)$Name,
+        error = function(e) {
+            stop(
+                "Cannot inspect ZIP archive '",
+                source,
+                "': ",
+                conditionMessage(e),
+                call. = FALSE
+            )
+        }
+    )
+    files <- listing[!grepl("/$", listing)]
+    if (length(files) != 1L || !grepl("[.]json$", files[[1L]])) {
+        stop(
+            "Expected a ZIP archive containing exactly one JSON file: ",
+            source,
+            call. = FALSE
+        )
+    }
+
+    extraction <- tempfile(".pdbtools-rename-unzip-")
+    dir.create(extraction, recursive = TRUE, showWarnings = FALSE)
+    on.exit(unlink(extraction, recursive = TRUE, force = TRUE), add = TRUE)
+    utils::unzip(source, exdir = extraction)
+    old_member <- file.path(extraction, files[[1L]])
+    new_member <- file.path(extraction, member_name)
+    dir.create(dirname(new_member), recursive = TRUE, showWarnings = FALSE)
+    if (!file.rename(old_member, new_member)) {
+        stop("Could not rename the ZIP member.", call. = FALSE)
+    }
+
+    oldwd <- setwd(extraction)
+    on.exit(setwd(oldwd), add = TRUE)
+    zip_destination <- paste0(destination, ".zip")
+    utils::zip(zip_destination, files = member_name, flags = "-jq")
+    setwd(oldwd)
+    if (!file.rename(zip_destination, destination)) {
+        stop("Could not finalize the staged ZIP archive.", call. = FALSE)
+    }
+    invisible(TRUE)
+}
+
+pdbtools_rename_commit <- function(actions, root) {
+    if (!length(actions)) {
+        return(invisible(TRUE))
+    }
+
+    action_list <- unname(actions)
+    sources <- vapply(action_list, `[[`, character(1), "source")
+    targets <- vapply(action_list, `[[`, character(1), "target")
+    if (anyDuplicated(targets)) {
+        stop("The rename plan has duplicate target paths.", call. = FALSE)
+    }
+
+    source_abs <- vapply(
+        sources,
+        function(path) pdbtools_rename_relpath(root, path),
+        character(1)
+    )
+    target_abs <- vapply(
+        targets,
+        function(path) pdbtools_rename_relpath(root, path),
+        character(1)
+    )
+    if (any(!file.exists(source_abs))) {
+        missing <- sources[!file.exists(source_abs)]
+        stop(
+            "The rename plan refers to missing source file(s): ",
+            paste(missing, collapse = ", "),
+            call. = FALSE
+        )
+    }
+
+    source_set <- unique(source_abs)
+    unexpected_targets <- target_abs[
+        file.exists(target_abs) & !(target_abs %in% source_set)
+    ]
+    if (length(unexpected_targets)) {
+        stop(
+            "Refusing to overwrite existing file '",
+            unexpected_targets[[1L]],
+            "'.",
+            call. = FALSE
+        )
+    }
+    if (any(target_abs %in% source_abs & target_abs != source_abs)) {
+        stop(
+            "The rename plan contains a target that is another source file.",
+            call. = FALSE
+        )
+    }
+
+    stage <- tempfile(".pdbtools-rename-stage-", tmpdir = dirname(root))
+    backup <- tempfile(".pdbtools-rename-backup-", tmpdir = dirname(root))
+    dir.create(stage, recursive = TRUE, showWarnings = FALSE)
+    dir.create(backup, recursive = TRUE, showWarnings = FALSE)
+    cleanup <- function() {
+        unlink(stage, recursive = TRUE, force = TRUE)
+        unlink(backup, recursive = TRUE, force = TRUE)
+    }
+    on.exit(cleanup(), add = TRUE)
+
+    staged <- character(length(action_list))
+    backups <- character(length(action_list))
+    for (i in seq_along(action_list)) {
+        staged[[i]] <- file.path(stage, sprintf("%06d", i))
+        backups[[i]] <- file.path(backup, sprintf("%06d", i))
+        action <- action_list[[i]]
+        if (!is.null(action$zip_member)) {
+            pdbtools_rename_stage_zip(
+                source_abs[[i]],
+                staged[[i]],
+                action$zip_member
+            )
+        } else if (!is.null(action$content)) {
+            writeLines(action$content, staged[[i]], useBytes = TRUE)
+        } else if (!file.copy(source_abs[[i]], staged[[i]], overwrite = FALSE)) {
+            stop("Could not stage '", sources[[i]], "'.", call. = FALSE)
+        }
+    }
+
+    backed_up <- 0L
+    committed <- 0L
+    rollback <- function() {
+        if (committed > 0L) {
+            for (i in seq.int(committed, 1L)) {
+                unlink(target_abs[[i]], force = TRUE)
+            }
+        }
+        if (backed_up > 0L) {
+            for (i in seq.int(backed_up, 1L)) {
+                if (file.exists(backups[[i]])) {
+                    dir.create(
+                        dirname(source_abs[[i]]),
+                        recursive = TRUE,
+                        showWarnings = FALSE
+                    )
+                    file.rename(backups[[i]], source_abs[[i]])
+                }
+            }
+        }
+    }
+
+    for (i in seq_along(action_list)) {
+        if (!file.rename(source_abs[[i]], backups[[i]])) {
+            rollback()
+            stop(
+                "Could not reserve source file '",
+                sources[[i]],
+                "'; no changes were kept.",
+                call. = FALSE
+            )
+        }
+        backed_up <- i
+    }
+    for (i in seq_along(action_list)) {
+        dir.create(
+            dirname(target_abs[[i]]),
+            recursive = TRUE,
+            showWarnings = FALSE
+        )
+        if (!file.rename(staged[[i]], target_abs[[i]])) {
+            rollback()
+            stop(
+                "Could not install target file '",
+                targets[[i]],
+                "'; the migration was rolled back.",
+                call. = FALSE
+            )
+        }
+        committed <- i
+    }
+    invisible(TRUE)
+}
+
+pdbtools_rename_reference_files <- function(root, old_name) {
+    reference_root <- file.path(root, "reference_posteriors")
+    if (!dir.exists(reference_root)) {
+        return(character())
+    }
+    files <- list.files(reference_root, full.names = TRUE, recursive = TRUE)
+    files[basename(files) %in% c(
+        paste0(old_name, ".info.json"),
+        paste0(old_name, ".json"),
+        paste0(old_name, ".json.zip")
+    )]
+}
+
+pdbtools_rename_add_reference_actions <- function(
+    actions,
+    root,
+    old_name,
+    new_name
+) {
+    files <- pdbtools_rename_reference_files(root, old_name)
+    if (!length(files)) {
+        stop(
+            "Reference posterior '",
+            old_name,
+            "' is linked but no reference files were found.",
+            call. = FALSE
+        )
+    }
+    for (source in files) {
+        relative <- substring(
+            normalizePath(source, mustWork = FALSE),
+            nchar(normalizePath(root, mustWork = FALSE)) + 2L
+        )
+        target <- file.path(
+            dirname(relative),
+            paste0(new_name, substring(basename(relative), nchar(old_name) + 1L))
+        )
+        content <- NULL
+        if (grepl("[.]info[.]json$", relative)) {
+            info <- pdbtools_rename_read_json(source)
+            info$name <- new_name
+            content <- pdbtools_rename_json_text(info)
+        }
+        zip_member <- if (grepl("[.]json[.]zip$", relative)) {
+            paste0(new_name, ".json")
+        } else {
+            NULL
+        }
+        actions <- pdbtools_rename_add_action(
+            actions,
+            relative,
+            target,
+            content,
+            zip_member
+        )
+    }
+    actions
+}
+
+pdbtools_rename_infer_type <- function(root, old_name, type = NULL) {
+    choices <- c("data", "model", "posterior")
+    if (!is.null(type)) {
+        if (!is.character(type) || length(type) != 1L ||
+            is.na(type) || !type %in% choices) {
+            stop("`type` must be one of: data, model, posterior.", call. = FALSE)
+        }
+        return(type)
+    }
+    exists <- c(
+        data = file.exists(file.path(root, "data", "info", paste0(old_name, ".info.json"))),
+        model = file.exists(file.path(root, "models", "info", paste0(old_name, ".info.json"))),
+        posterior = file.exists(file.path(root, "posteriors", paste0(old_name, ".json")))
+    )
+    if (sum(exists) != 1L) {
+        stop(
+            "`type` is required unless the old name identifies exactly one data, model, or posterior.",
+            call. = FALSE
+        )
+    }
+    names(exists)[exists]
+}
+
+pdbtools_rename_entity <- function(
+    database_path,
+    old_name,
+    new_name,
+    type = NULL
+) {
+    root <- normalizePath(
+        file.path(database_path, "posterior_database"),
+        mustWork = TRUE
+    )
+    pdbtools_rename_validate_name(old_name)
+    pdbtools_rename_validate_name(new_name)
+    if (identical(old_name, new_name)) {
+        return(list(
+            type = pdbtools_rename_infer_type(root, old_name, type),
+            old_name = old_name,
+            new_name = new_name,
+            posterior_renames = list(),
+            affected_posteriors = character(),
+            files = character()
+        ))
+    }
+    type <- pdbtools_rename_infer_type(root, old_name, type)
+    actions <- list()
+
+    add_action <- function(source, target, content = NULL, zip_member = NULL) {
+        actions <<- pdbtools_rename_add_action(
+            actions,
+            source,
+            target,
+            content,
+            zip_member
+        )
+    }
+
+    if (identical(type, "data")) {
+        info_rel <- file.path("data", "info", paste0(old_name, ".info.json"))
+        info_path <- pdbtools_rename_relpath(root, info_rel)
+        data_rel <- file.path(
+            "data",
+            "data",
+            paste0(old_name, c(".json.zip", ".json"))
+        )
+        data_rel <- data_rel[vapply(
+            data_rel,
+            function(path) file.exists(pdbtools_rename_relpath(root, path)),
+            logical(1)
+        )]
+        if (!length(data_rel)) {
+            stop("No data file was found for '", old_name, "'.", call. = FALSE)
+        }
+        data_info <- pdbtools_rename_read_json(info_path)
+        if (!identical(data_info$name, old_name)) {
+            stop("Data metadata name does not match its filename.", call. = FALSE)
+        }
+        data_info$name <- new_name
+        # PosteriorDB metadata uses the unzipped logical JSON path even when
+        # the stored data object is compressed as <name>.json.zip.
+        data_info$data_file <- paste0("data/data/", new_name, ".json")
+        add_action(
+            info_rel,
+            file.path("data", "info", paste0(new_name, ".info.json")),
+            pdbtools_rename_json_text(data_info)
+        )
+        for (source in data_rel) {
+            target <- file.path(
+                dirname(source),
+                paste0(new_name, substring(basename(source), nchar(old_name) + 1L))
+            )
+            member <- if (grepl("[.]json[.]zip$", source)) {
+                paste0(new_name, ".json")
+            } else {
+                NULL
+            }
+            add_action(source, target, zip_member = member)
+        }
+        entity_field <- "data_name"
+    } else if (identical(type, "model")) {
+        info_rel <- file.path("models", "info", paste0(old_name, ".info.json"))
+        info_path <- pdbtools_rename_relpath(root, info_rel)
+        model_info <- pdbtools_rename_read_json(info_path)
+        if (!identical(model_info$name, old_name)) {
+            stop("Model metadata name does not match its filename.", call. = FALSE)
+        }
+        implementations <- model_info$model_implementations
+        if (is.null(implementations) || !length(implementations)) {
+            stop("Model '", old_name, "' has no implementations.", call. = FALSE)
+        }
+        model_info$name <- new_name
+        for (implementation in seq_along(implementations)) {
+            fields <- names(implementations[[implementation]])
+            for (field in fields) {
+                value <- implementations[[implementation]][[field]]
+                new_value <- pdbtools_rename_model_path(value, old_name, new_name)
+                if (!identical(value, new_value)) {
+                    source <- gsub("\\\\", "/", value)
+                    target <- gsub("\\\\", "/", new_value)
+                    pdbtools_rename_relpath(root, source)
+                    pdbtools_rename_relpath(root, target)
+                    add_action(source, target)
+                    model_info$model_implementations[[implementation]][[field]] <- new_value
+                }
+            }
+        }
+        add_action(
+            info_rel,
+            file.path("models", "info", paste0(new_name, ".info.json")),
+            pdbtools_rename_json_text(model_info)
+        )
+        entity_field <- "model_name"
+    } else {
+        posterior_rel <- file.path("posteriors", paste0(old_name, ".json"))
+        if (!file.exists(pdbtools_rename_relpath(root, posterior_rel))) {
+            stop("No posterior was found for '", old_name, "'.", call. = FALSE)
+        }
+        entity_field <- NULL
+    }
+
+    posterior_dir <- file.path(root, "posteriors")
+    posterior_paths <- if (dir.exists(posterior_dir)) {
+        list.files(
+            posterior_dir,
+            pattern = "[.]json$",
+            full.names = TRUE,
+            recursive = FALSE
+        )
+    } else {
+        character()
+    }
+    posterior_records <- lapply(posterior_paths, function(path) {
+        record <- pdbtools_rename_read_json(path)
+        if (is.null(record$name)) {
+            stop("Posterior file '", path, "' has no `name` field.", call. = FALSE)
+        }
+        record$.rename_path <- path
+        record
+    })
+
+    affected <- list()
+    for (record in posterior_records) {
+        is_affected <- if (is.null(entity_field)) {
+            identical(record$name, old_name)
+        } else {
+            identical(record[[entity_field]], old_name)
+        }
+        if (!is_affected) {
+            next
+        }
+
+        old_posterior_name <- record$name
+        other_name <- if (identical(type, "data")) {
+            record$model_name
+        } else {
+            record$data_name
+        }
+        expected_old <- if (is.null(entity_field)) {
+            old_name
+        } else if (identical(type, "data")) {
+            paste(old_name, other_name, sep = "-")
+        } else {
+            paste(other_name, old_name, sep = "-")
+        }
+        new_posterior_name <- old_posterior_name
+        if (identical(old_posterior_name, expected_old)) {
+            new_posterior_name <- if (identical(type, "data")) {
+                paste(new_name, other_name, sep = "-")
+            } else if (identical(type, "model")) {
+                paste(other_name, new_name, sep = "-")
+            } else {
+                new_name
+            }
+        }
+        if (identical(type, "data")) {
+            record$data_name <- new_name
+        }
+        if (identical(type, "model")) {
+            record$model_name <- new_name
+        }
+        if (
+            identical(record$reference_posterior_name, old_posterior_name) &&
+                !identical(new_posterior_name, old_posterior_name)
+        ) {
+            record$reference_posterior_name <- new_posterior_name
+        }
+        record$name <- new_posterior_name
+
+        actual_relative <- substring(
+            normalizePath(record$.rename_path, mustWork = FALSE),
+            nchar(normalizePath(root, mustWork = FALSE)) + 2L
+        )
+        expected_relative <- file.path(
+            "posteriors",
+            paste0(old_posterior_name, ".json")
+        )
+        if (!identical(actual_relative, expected_relative)) {
+            stop(
+                "Posterior file '",
+                actual_relative,
+                "' disagrees with its `name` field.",
+                call. = FALSE
+            )
+        }
+        serializable <- record[setdiff(names(record), ".rename_path")]
+        add_action(
+            expected_relative,
+            file.path("posteriors", paste0(new_posterior_name, ".json")),
+            pdbtools_rename_json_text(serializable)
+        )
+        affected[[length(affected) + 1L]] <- list(
+            old = old_posterior_name,
+            new = new_posterior_name,
+            reference = record$reference_posterior_name
+        )
+    }
+
+    all_references <- vapply(
+        posterior_records,
+        function(record) {
+            reference <- record$reference_posterior_name
+            if (is.null(reference) || !length(reference)) "" else as.character(reference[[1L]])
+        },
+        character(1)
+    )
+    affected_old <- if (length(affected)) {
+        vapply(affected, `[[`, character(1), "old")
+    } else {
+        character()
+    }
+    for (item in affected) {
+        if (
+            identical(item$old, item$new) ||
+                is.null(item$reference) ||
+                !length(item$reference) ||
+                !identical(item$reference, item$new)
+        ) {
+            next
+        }
+        users <- which(all_references == item$old)
+        if (
+            length(users) &&
+                any(!vapply(
+                    posterior_records[users],
+                    function(record) record$name %in% affected_old,
+                    logical(1)
+                ))
+        ) {
+            stop(
+                "Reference posterior '",
+                item$old,
+                "' is shared with an unaffected posterior.",
+                call. = FALSE
+            )
+        }
+        actions <- pdbtools_rename_add_reference_actions(
+            actions,
+            root,
+            item$old,
+            item$new
+        )
+    }
+
+    alias_path <- file.path(root, "alias", "posteriors.json")
+    if (file.exists(alias_path) && length(affected)) {
+        aliases <- pdbtools_rename_read_json(alias_path)
+        changed <- FALSE
+        for (item in affected) {
+            for (i in seq_along(aliases)) {
+                if (identical(aliases[[i]], item$old)) {
+                    aliases[[i]] <- item$new
+                    changed <- TRUE
+                }
+            }
+        }
+        if (changed) {
+            add_action(
+                file.path("alias", "posteriors.json"),
+                file.path("alias", "posteriors.json"),
+                pdbtools_rename_json_text(aliases)
+            )
+        }
+    }
+
+    pdbtools_rename_commit(actions, root)
+    list(
+        type = type,
+        old_name = old_name,
+        new_name = new_name,
+        posterior_renames = affected,
+        affected_posteriors = if (length(affected)) {
+            vapply(affected, `[[`, character(1), "new")
+        } else {
+            character()
+        },
+        files = vapply(unname(actions), `[[`, character(1), "target")
+    )
+}
+
 PDBEntryBuilder <- R6::R6Class(
     "PDBEntryBuilder",
 
@@ -51,6 +721,50 @@ PDBEntryBuilder <- R6::R6Class(
             self$adder <- added_by
             private$pdb <- posteriordb::pdb_local(path = self$path)
             invisible(self)
+        },
+        rename_pdb = function(old_name, new_name, type = NULL) {
+            migration <- pdbtools_rename_entity(
+                database_path = self$path,
+                old_name = old_name,
+                new_name = new_name,
+                type = type
+            )
+
+            # Keep the builder's in-memory state usable after the migration.
+            if (identical(self$data_name, old_name)) {
+                self$data_name <- new_name
+            }
+            if (identical(self$model_name, old_name)) {
+                self$model_name <- new_name
+            }
+            if (!is.null(self$stan_file) &&
+                identical(basename(self$stan_file), paste0(old_name, ".stan"))) {
+                self$stan_file <- file.path(
+                    dirname(self$stan_file),
+                    paste0(new_name, ".stan")
+                )
+            }
+            if (is.list(self$posterior)) {
+                if (identical(self$posterior$data_name, old_name)) {
+                    self$posterior$data_name <- new_name
+                }
+                if (identical(self$posterior$model_name, old_name)) {
+                    self$posterior$model_name <- new_name
+                }
+                for (rename in migration$posterior_renames) {
+                    if (identical(self$posterior$name, rename$old)) {
+                        self$posterior$name <- rename$new
+                    }
+                    if (identical(
+                        self$posterior$reference_posterior_name,
+                        rename$old
+                    )) {
+                        self$posterior$reference_posterior_name <- rename$new
+                    }
+                }
+            }
+            self$refresh()
+            invisible(migration)
         },
         create_data = function(data, info) {
             if (!inherits(info, "pdb_data_info")) {
