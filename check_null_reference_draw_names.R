@@ -27,7 +27,7 @@ reference_info_dir <- file.path(
 )
 
 # Set to TRUE to write a CSV report; FALSE prints the matching records.
-save_output <- TRUE
+save_output <- FALSE
 output_file <- "null_reference_name_with_draws.csv"
 
 # Set to TRUE to repair safe matches automatically.
