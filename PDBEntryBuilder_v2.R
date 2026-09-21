@@ -679,6 +679,7 @@ PDBEntryBuilder <- R6::R6Class(
         stan_file = NULL,
         model_code = NULL,
         model_name = NULL,
+        stan_backend = NULL,
         posterior = NULL,
         rp = NULL,
         initialize = function(
@@ -687,14 +688,16 @@ PDBEntryBuilder <- R6::R6Class(
             auto_write = TRUE,
             n_threads = 2,
             detect_cores = TRUE,
-            n_cores = NULL
+            n_cores = NULL,
+            backend = "rstan"
         ) {
+            backend <- match.arg(backend, c("rstan", "cmdstanr"))
             required_packages <- c(
-                "rstan",
                 "posterior",
                 "posteriordb",
                 "checkmate"
             )
+            required_packages <- c(required_packages, backend)
             missing_packages <- required_packages[
                 !vapply(
                     required_packages,
@@ -710,7 +713,9 @@ PDBEntryBuilder <- R6::R6Class(
                     call. = FALSE
                 )
             }
-            rstan::rstan_options(auto_write = auto_write)
+            if (identical(backend, "rstan")) {
+                rstan::rstan_options(auto_write = auto_write)
+            }
             if (detect_cores) {
                 options(mc.cores = parallel::detectCores())
             } else if (!is.null(n_cores)) {
@@ -719,6 +724,7 @@ PDBEntryBuilder <- R6::R6Class(
             Sys.setenv(STAN_NUM_THREADS = n_threads)
             self$path <- normalizePath(path, mustWork = TRUE)
             self$adder <- added_by
+            self$stan_backend <- backend
             private$pdb <- posteriordb::pdb_local(path = self$path)
             invisible(self)
         },
@@ -870,7 +876,7 @@ PDBEntryBuilder <- R6::R6Class(
             if (
                 is.null(reference_info) ||
                     is.null(reference_info$name) ||
-                    is.null(stan_fit@model_name)
+                    is.null(self$get_fit_model_name(stan_fit))
             ) {
                 stop(
                     "The Stan fit must contain a model name and reference-posterior info.",
@@ -878,7 +884,7 @@ PDBEntryBuilder <- R6::R6Class(
                 )
             }
             self$link_reference_posterior(
-                posterior_name = stan_fit@model_name,
+                posterior_name = self$get_fit_model_name(stan_fit),
                 reference_posterior_name = reference_info$name,
                 verify = verify
             )
@@ -974,18 +980,39 @@ PDBEntryBuilder <- R6::R6Class(
                 )
             }
 
-            fit <- suppressWarnings(
-                rstan::stan(
-                    model_code = as.character(model_code),
-                    chains = 1,
-                    iter = 4,
-                    warmup = 2,
-                    refresh = 0,
-                    data = data
+            model_dims <- if (identical(self$stan_backend, "rstan")) {
+                fit <- suppressWarnings(
+                    rstan::stan(
+                        model_code = as.character(model_code),
+                        chains = 1,
+                        iter = 4,
+                        warmup = 2,
+                        refresh = 0,
+                        data = data
+                    )
                 )
-            )
-
-            model_dims <- fit@par_dims
+                fit@par_dims
+            } else {
+                model <- cmdstanr::cmdstan_model(
+                    cmdstanr::write_stan_file(as.character(model_code)),
+                    compile = TRUE,
+                    quiet = TRUE
+                )
+                fit <- suppressWarnings(model$sample(
+                    data = data,
+                    chains = 1,
+                    iter_sampling = 2,
+                    iter_warmup = 2,
+                    refresh = 0
+                ))
+                draws <- posterior::as_draws_array(fit$draws())
+                vars <- posterior::variables(draws)
+                lapply(vars, function(name) {
+                    x <- posterior::extract_variable(draws, name)
+                    if (length(dim(x)) <= 1L) integer() else dim(x)[-1L]
+                }) |>
+                    stats::setNames(vars)
+            }
             available <- names(model_dims)
 
             if (!is.null(include)) {
@@ -1056,7 +1083,11 @@ PDBEntryBuilder <- R6::R6Class(
             }
             stan_model <- tryCatch(
                 {
-                    rstan::stan_model(file = stan_file)
+                    if (identical(self$stan_backend, "rstan")) {
+                        rstan::stan_model(file = stan_file)
+                    } else {
+                        paste(readLines(stan_file), collapse = "\n")
+                    }
                 },
                 error = function(e) {
                     stop(
@@ -1964,27 +1995,38 @@ PDBEntryBuilder <- R6::R6Class(
             added_by = self$adder,
             auto_check = TRUE,
             write = FALSE,
-            overwrite = FALSE
+            overwrite = FALSE,
+            backend = self$stan_backend
         ) {
             if (!auto_check && write) {
                 stop("Can't write draws without checking them first.")
             }
             posterior_objects <- self$get_posterior_modeldata(posterior_name)
-            sa <- list(
-                object = posterior_objects$stan_model,
-                data = posterior_objects$data
-            )
+            backend <- match.arg(backend, c("rstan", "cmdstanr"))
+            sa <- list(data = posterior_objects$data)
             if (is.null(control_args)) {
-                sa <- c(sa, sampling_args)
                 inference <- sampling_args
-            } else if (inherits(control_args, "list")) {
-                sa <- c(sa, sampling_args, control_args)
-                inference <- c(sampling_args, control_args)
-            } else {
+                control_args <- list()
+            } else if (!inherits(control_args, "list")) {
                 stop("`control_args` must be null or a list.", call. = FALSE)
+            } else {
+                inference <- sampling_args
+                inference <- c(sampling_args, control_args)
             }
-            stan_fit <- do.call(rstan::sampling, sa)
-            stan_fit@model_name <- posterior_name
+            stan_fit <- if (identical(backend, "rstan")) {
+                sa$object <- posterior_objects$stan_model
+                do.call(rstan::sampling, c(sa, sampling_args, control_args))
+            } else {
+                cmdstan_args <- self$translate_cmdstanr_args(
+                    sampling_args,
+                    control_args
+                )
+                do.call(
+                    posterior_objects$stan_model$sample,
+                    c(list(data = posterior_objects$data), cmdstan_args)
+                )
+            }
+            stan_fit <- self$set_fit_model_name(stan_fit, posterior_name)
             stan_fit <- self$set_reference_info(
                 stan_fit,
                 list(
@@ -1998,7 +2040,7 @@ PDBEntryBuilder <- R6::R6Class(
                     comments = comments,
                     added_by = added_by,
                     added_date = Sys.Date(),
-                    versions = private$get_sampling_version_info()
+                    versions = private$get_sampling_version_info(backend)
                 )
             )
             if (auto_check) {
@@ -2020,6 +2062,52 @@ PDBEntryBuilder <- R6::R6Class(
                 self$link_reference_posterior_from_stan_fit(stan_fit)
             }
             invisible(stan_fit)
+        },
+        translate_cmdstanr_args = function(sampling_args, control_args) {
+            args <- sampling_args
+            if (!is.null(args$iter)) {
+                warmup <- if (is.null(args$warmup)) 0L else args$warmup
+                args$iter_sampling <- args$iter - warmup
+                args$iter_warmup <- warmup
+                args$iter <- NULL
+                args$warmup <- NULL
+            }
+            if (!is.null(args$cores)) {
+                args$parallel_chains <- args$cores
+                args$cores <- NULL
+            }
+            if (!is.null(args$control)) {
+                control_args <- c(args$control, control_args)
+                args$control <- NULL
+            }
+            if (length(control_args)) {
+                if (!is.null(control_args$adapt_delta)) {
+                    args$adapt_delta <- control_args$adapt_delta
+                }
+                if (!is.null(control_args$max_treedepth)) {
+                    args$max_treedepth <- control_args$max_treedepth
+                }
+            }
+            args$object <- NULL
+            args
+        },
+        set_fit_model_name = function(fit, model_name) {
+            if (inherits(fit, "stanfit")) {
+                fit@model_name <- model_name
+            } else {
+                attr(fit, "model_name") <- model_name
+            }
+            fit
+        },
+        get_fit_model_name = function(fit) {
+            if (inherits(fit, "stanfit")) fit@model_name else attr(fit, "model_name")
+        },
+        get_fit_draws = function(fit, format = "draws_array") {
+            if (inherits(fit, "stanfit")) {
+                posterior::as_draws_array(fit)
+            } else {
+                fit$draws(format = format)
+            }
         },
         write_rpi_from_stan_fit = function(
             stan_fit,
@@ -2062,7 +2150,8 @@ PDBEntryBuilder <- R6::R6Class(
                     call. = FALSE
                 )
             }
-            info_path <- self$get_rpi_path(stan_fit@model_name)
+            fit_name <- self$get_fit_model_name(stan_fit)
+            info_path <- self$get_rpi_path(fit_name)
             dir.create(
                 dirname(info_path),
                 recursive = TRUE,
@@ -2075,7 +2164,7 @@ PDBEntryBuilder <- R6::R6Class(
                 )
             }
             temp_info <- tempfile(
-                pattern = paste0(stan_fit@model_name, "-"),
+                pattern = paste0(fit_name, "-"),
                 tmpdir = dirname(info_path),
                 fileext = ".json"
             )
@@ -2113,33 +2202,34 @@ PDBEntryBuilder <- R6::R6Class(
             overwrite = FALSE,
             verify = TRUE
         ) {
-            if (!file.exists(self$get_rpi_path(stan_fit@model_name))) {
+            fit_name <- self$get_fit_model_name(stan_fit)
+            if (!file.exists(self$get_rpi_path(fit_name))) {
                 stop(
                     "Make sure to write the reference posterior information to disk before writing the draws",
                     call. = FALSE
                 )
             }
-            to_keep <- self$get_posterior_dims(stan_fit@model_name)
+            to_keep <- self$get_posterior_dims(fit_name)
             draws <- posterior::subset_draws(
-                posterior::as_draws_array(stan_fit),
+                self$get_fit_draws(stan_fit),
                 variable = names(to_keep)
             )
-            rp_path <- self$get_rp_path(stan_fit@model_name)
+            rp_path <- self$get_rp_path(fit_name)
             dir.create(dirname(rp_path), recursive = TRUE, showWarnings = FALSE)
             if (file.exists(rp_path) && !overwrite) {
                 stop("Reference-draw archive already exists.", call. = FALSE)
             }
             temp_dir <- tempfile(
-                pattern = paste0(stan_fit@model_name, "-"),
+                pattern = paste0(fit_name, "-"),
                 tmpdir = dirname(rp_path)
             )
             dir.create(temp_dir)
             json_path <- file.path(
                 temp_dir,
-                paste0(stan_fit@model_name, ".json")
+                paste0(fit_name, ".json")
             )
             temp_zip <- tempfile(
-                pattern = paste0(stan_fit@model_name, "-"),
+                pattern = paste0(fit_name, "-"),
                 tmpdir = dirname(rp_path),
                 fileext = ".json.zip"
             )
@@ -2211,11 +2301,11 @@ PDBEntryBuilder <- R6::R6Class(
             )
         },
         verify_reference_files = function(stan_fit, expected_draws = NULL) {
-            posterior_name <- stan_fit@model_name
+            posterior_name <- self$get_fit_model_name(stan_fit)
             if (is.null(expected_draws)) {
                 variables <- names(self$get_posterior_dims(posterior_name))
                 expected_draws <- posterior::subset_draws(
-                    posterior::as_draws_array(stan_fit),
+                    self$get_fit_draws(stan_fit),
                     variable = variables
                 )
             }
@@ -2270,7 +2360,7 @@ PDBEntryBuilder <- R6::R6Class(
             ess_failures <- self$get_ess_bounds_failures(diagnostics)
             ess_within_bounds <- ess_failures$total_count == 0L
             diagnostic_draws <- posterior::subset_draws(
-                posterior::as_draws_array(stan_fit),
+                self$get_fit_draws(stan_fit),
                 variable = names(diagnostics$rhat)
             )
             list(
@@ -2589,10 +2679,10 @@ PDBEntryBuilder <- R6::R6Class(
             all(checked_rhat < threshold)
         },
         get_diagnostics = function(stan_fit, to_keep = NULL) {
-            diag_summ <- rstan::get_sampler_params(stan_fit, inc_warmup = FALSE)
-            draws <- posterior::as_draws_df(stan_fit)
+            diag_summ <- self$get_fit_sampler_diagnostics(stan_fit)
+            draws <- posterior::as_draws_df(self$get_fit_draws(stan_fit))
             if (is.null(to_keep)) {
-                to_keep <- self$get_posterior_dims(stan_fit@model_name)
+                to_keep <- self$get_posterior_dims(self$get_fit_model_name(stan_fit))
             }
             if (length(to_keep) != 0) {
                 draws <- posterior::subset_draws(draws, names(to_keep))
@@ -2618,17 +2708,40 @@ PDBEntryBuilder <- R6::R6Class(
                     diagnostic_names
                 ),
                 rhat = stats::setNames(summ$rhat, diagnostic_names),
-                divergent_transitions = sapply(
-                    diag_summ,
-                    function(x) {
-                        sum(x[, "divergent__"])
-                    }
-                ),
-                efmi = rstan::get_bfmi(stan_fit),
+                divergent_transitions = self$get_fit_divergences(diag_summ),
+                efmi = self$get_fit_efmi(stan_fit, diag_summ),
                 mean_lag1_ac = self$compute_mean_lag1_ac(draws),
                 mean_lag1_ac_posterior = self$compute_ac(draws)
             )
             diagnostics
+        },
+        get_fit_sampler_diagnostics = function(fit) {
+            if (inherits(fit, "stanfit")) {
+                rstan::get_sampler_params(fit, inc_warmup = FALSE)
+            } else {
+                fit$sampler_diagnostics(format = "draws_array")
+            }
+        },
+        get_fit_divergences = function(diag_summ) {
+            if (is.list(diag_summ)) {
+                vapply(diag_summ, function(x) sum(x[, "divergent__"]), numeric(1))
+            } else {
+                values <- diag_summ[, , "divergent__"]
+                colSums(values)
+            }
+        },
+        get_fit_efmi = function(fit, diag_summ) {
+            if (inherits(fit, "stanfit")) {
+                return(rstan::get_bfmi(fit))
+            }
+            energy <- diag_summ[, , "energy__"]
+            apply(energy, 2L, function(x) {
+                if (length(x) < 2L || !is.finite(stats::var(x)) || stats::var(x) == 0) {
+                    NA_real_
+                } else {
+                    sum(diff(x)^2) / (2 * stats::var(x) * length(x))
+                }
+            })
         },
         get_posterior_json = function(
             posterior_name,
@@ -2814,10 +2927,17 @@ PDBEntryBuilder <- R6::R6Class(
                     call. = FALSE
                 )
             }
-            posterior_model <- rstan::stan_model(
-                file = md_files$model_file,
-                model_name = posterior_name
-            )
+            posterior_model <- if (identical(self$stan_backend, "rstan")) {
+                rstan::stan_model(
+                    file = md_files$model_file,
+                    model_name = posterior_name
+                )
+            } else {
+                cmdstanr::cmdstan_model(
+                    md_files$model_file,
+                    quiet = TRUE
+                )
+            }
             posterior_model_code <- paste(
                 readLines(md_files$model_file),
                 collapse = "\n"
@@ -2866,8 +2986,8 @@ PDBEntryBuilder <- R6::R6Class(
                 )
             }
             draws <- posterior::subset_draws(
-                posterior::as_draws_array(stan_fit),
-                variable = names(self$get_posterior_dims(stan_fit@model_name))
+                self$get_fit_draws(stan_fit),
+                variable = names(self$get_posterior_dims(self$get_fit_model_name(stan_fit)))
             )
             mean_summary <- posterior::summarize_draws(
                 draws,
@@ -2908,7 +3028,7 @@ PDBEntryBuilder <- R6::R6Class(
                 utils::packageVersion("posterior")
             )
             paths <- lapply(names(summaries), function(type) {
-                private$get_summary_statistic_paths(stan_fit@model_name, type)
+                private$get_summary_statistic_paths(self$get_fit_model_name(stan_fit), type)
             })
             names(paths) <- names(summaries)
             destinations <- unlist(paths, use.names = FALSE)
@@ -3234,7 +3354,7 @@ PDBEntryBuilder <- R6::R6Class(
             }
             matches
         },
-        get_sampling_version_info = function() {
+        get_sampling_version_info = function(backend = self$stan_backend) {
             M <- file.path(
                 Sys.getenv("HOME"),
                 ".R",
@@ -3249,8 +3369,7 @@ PDBEntryBuilder <- R6::R6Class(
             } else {
                 "[Could not find Makevar file]"
             }
-            list(
-                rstan_version = paste("rstan", utils::packageVersion("rstan")),
+            versions <- list(
                 r_Makevars = paste(Mfile, collapse = "\n"),
                 r_version = R.version$version.string,
                 r_session = paste(
@@ -3258,6 +3377,14 @@ PDBEntryBuilder <- R6::R6Class(
                     collapse = "\n"
                 )
             )
+            if (identical(backend, "rstan")) {
+                versions$rstan_version <- paste("rstan", utils::packageVersion("rstan"))
+            } else {
+                versions$backend <- backend
+                versions$cmdstanr_version <- paste("cmdstanr", utils::packageVersion("cmdstanr"))
+                versions$cmdstan_version <- cmdstanr::cmdstan_version()
+            }
+            versions
         },
         get_reference_path = function(
             local_bib_path = "posterior_database/bibliography/references.bib"
