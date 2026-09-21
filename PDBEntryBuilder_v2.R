@@ -766,6 +766,123 @@ PDBEntryBuilder <- R6::R6Class(
             self$refresh()
             invisible(migration)
         },
+        link_reference_posterior = function(
+            posterior_name,
+            reference_posterior_name = posterior_name,
+            verify = TRUE
+        ) {
+            checkmate::assert_string(posterior_name, min.chars = 1L)
+            checkmate::assert_string(
+                reference_posterior_name,
+                min.chars = 1L
+            )
+            checkmate::assert_flag(verify)
+
+            info_path <- self$get_rpi_path(reference_posterior_name)
+            draws_path <- self$get_rp_path(reference_posterior_name)
+            if (!file.exists(info_path) || !file.exists(draws_path)) {
+                stop(
+                    "Cannot link reference posterior `",
+                    reference_posterior_name,
+                    "`: both its info JSON and draw archive must exist.",
+                    call. = FALSE
+                )
+            }
+            reference_info <- jsonlite::read_json(
+                info_path,
+                simplifyVector = FALSE
+            )
+            if (!identical(reference_info$name, reference_posterior_name)) {
+                stop(
+                    "Reference-posterior info name does not match its file name.",
+                    call. = FALSE
+                )
+            }
+
+            posterior_object <- posteriordb::posterior(
+                posterior_name,
+                private$pdb
+            )
+            current_reference <- posterior_object$reference_posterior_name
+            if (
+                !is.null(current_reference) &&
+                    !identical(current_reference, reference_posterior_name)
+            ) {
+                stop(
+                    "Posterior already points to a different reference posterior: ",
+                    current_reference,
+                    call. = FALSE
+                )
+            }
+
+            changed <- is.null(current_reference)
+            if (changed) {
+                posterior_object$reference_posterior_name <-
+                    reference_posterior_name
+                # This is an intentional metadata update to an existing
+                # posterior, not replacement of the model/data definition.
+                posteriordb::write_pdb(
+                    posterior_object,
+                    private$pdb,
+                    overwrite = TRUE
+                )
+                if (exists(
+                    "pdb_clear_cache",
+                    envir = asNamespace("posteriordb"),
+                    inherits = FALSE
+                )) {
+                    try(
+                        posteriordb:::pdb_clear_cache(private$pdb),
+                        silent = TRUE
+                    )
+                }
+                self$refresh()
+            }
+
+            if (verify) {
+                posterior_path <- file.path(
+                    self$get_pdb_path(),
+                    "posterior_database",
+                    "posteriors",
+                    paste0(posterior_name, ".json")
+                )
+                written <- jsonlite::read_json(
+                    posterior_path,
+                    simplifyVector = FALSE
+                )
+                if (!identical(
+                    written$reference_posterior_name,
+                    reference_posterior_name
+                )) {
+                    stop(
+                        "Posterior reference link failed round-trip verification.",
+                        call. = FALSE
+                    )
+                }
+            }
+            invisible(changed)
+        },
+        link_reference_posterior_from_stan_fit = function(
+            stan_fit,
+            verify = TRUE
+        ) {
+            reference_info <- self$get_reference_info(stan_fit)
+            if (
+                is.null(reference_info) ||
+                    is.null(reference_info$name) ||
+                    is.null(stan_fit@model_name)
+            ) {
+                stop(
+                    "The Stan fit must contain a model name and reference-posterior info.",
+                    call. = FALSE
+                )
+            }
+            self$link_reference_posterior(
+                posterior_name = stan_fit@model_name,
+                reference_posterior_name = reference_info$name,
+                verify = verify
+            )
+        },
         create_data = function(data, info) {
             if (!inherits(info, "pdb_data_info")) {
                 if (!is.list(info)) {
@@ -1586,6 +1703,7 @@ PDBEntryBuilder <- R6::R6Class(
                                         verify = TRUE
                                     )
                                     self$verify_reference_files(fit)
+                                    self$link_reference_posterior_from_stan_fit(fit)
                                     written <- TRUE
                                 }
                             }
@@ -1770,6 +1888,8 @@ PDBEntryBuilder <- R6::R6Class(
                     overwrite = overwrite,
                     verify = TRUE
                 )
+                self$verify_reference_files(stan_fit)
+                self$link_reference_posterior_from_stan_fit(stan_fit)
             }
             invisible(stan_fit)
         },
