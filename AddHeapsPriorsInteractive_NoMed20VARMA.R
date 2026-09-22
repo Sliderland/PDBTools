@@ -36,7 +36,8 @@ skip_known_problematic_workflows <- TRUE
 known_problematic_workflows <- c(
   "heaps_small3_statinvert_varma-statinvert_varma",
   "heaps_med10_statinvert_varma-statinvert_varma",
-  "heaps_med10_statrml_var-statrml_var"
+  "heaps_med10_statrml_var-statrml_var",
+  "heaps_med20_semiconj_var-semiconj_var"
 )
 
 register_entries <- FALSE
@@ -48,7 +49,7 @@ continue_on_error <- TRUE
 
 # Retain completed but non-passing rstanfit objects outside PosteriorDB for
 # later diagnostics. These files can be large; leave disabled unless needed.
-save_failed_fits <- FALSE
+save_failed_fits <- TRUE
 failed_fit_dir <- path.expand(
   "~/Documents/PDBTools_diagnostics/failed_reference_fits"
 )

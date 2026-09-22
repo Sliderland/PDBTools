@@ -1783,7 +1783,8 @@ PDBEntryBuilder <- R6::R6Class(
                   "sampling_args",
                   "auto_check",
                   "write",
-                  "overwrite"
+                  "overwrite",
+                  "compute_diagnostics"
                 )
               )
               unknown_reference_args <- setdiff(
@@ -1807,7 +1808,8 @@ PDBEntryBuilder <- R6::R6Class(
                   sampling_args = reference_spec$sampling_args,
                   auto_check = FALSE,
                   write = FALSE,
-                  overwrite = entry_overwrite
+                  overwrite = entry_overwrite,
+                  compute_diagnostics = FALSE
                 ),
                 reference_args
               )
@@ -1817,6 +1819,8 @@ PDBEntryBuilder <- R6::R6Class(
               )
 
               fit_info <- self$get_reference_info(fit)
+              fit_info$diagnostics <- self$get_diagnostics(fit)
+              fit <- self$set_reference_info(fit, fit_info)
               divergences_by_chain <-
                 fit_info$diagnostics$divergent_transitions
               total_divergences <- if (
@@ -1952,6 +1956,22 @@ PDBEntryBuilder <- R6::R6Class(
               failed_fit_path = failed_fit_path,
               error = conditionMessage(e)
             )
+          },
+          interrupt = function(e) {
+            # A user interrupt is not an `error` condition, so it bypasses
+            # the handler above.  If sampling has already returned and the
+            # interrupt happens during checking or writing, retain the fit
+            # before propagating the interrupt.  During Stan sampling `fit`
+            # is still NULL, and there is no completed fit to serialize.
+            save_failed_fit(
+              fit,
+              if (is.null(posterior_name)) entry_name else posterior_name,
+              list(
+                status = "interrupted",
+                error = conditionMessage(e)
+              )
+            )
+            stop(e)
           }
         )
         results[[i]] <- result
@@ -2040,7 +2060,8 @@ PDBEntryBuilder <- R6::R6Class(
       auto_check = TRUE,
       write = FALSE,
       overwrite = FALSE,
-      backend = self$stan_backend
+      backend = self$stan_backend,
+      compute_diagnostics = TRUE
     ) {
       if (!auto_check && write) {
         stop("Can't write draws without checking them first.")
@@ -2079,7 +2100,11 @@ PDBEntryBuilder <- R6::R6Class(
             method = "stan_sampling",
             method_arguments = inference
           ),
-          diagnostics = self$get_diagnostics(stan_fit),
+          diagnostics = if (compute_diagnostics) {
+            self$get_diagnostics(stan_fit)
+          } else {
+            NULL
+          },
           checks_made = list(),
           comments = comments,
           added_by = added_by,
