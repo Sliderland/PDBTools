@@ -98,8 +98,7 @@ results <- lapply(posterior_files, function(path) {
     posterior <- read_json_safely(path)
 
     if (!is.list(posterior) ||
-        !"reference_posterior_name" %in% names(posterior) ||
-        !is.null(posterior[["reference_posterior_name"]])) {
+        !"reference_posterior_name" %in% names(posterior)) {
         return(NULL)
     }
 
@@ -107,16 +106,54 @@ results <- lapply(posterior_files, function(path) {
     if (is.null(posterior_name) || length(posterior_name) != 1L) {
         posterior_name <- sub("\\.json$", "", basename(path), ignore.case = TRUE)
     }
-    if (length(posterior_name) != 1L || is.na(posterior_name)) {
+    if (length(posterior_name) != 1L ||
+        !is.character(posterior_name) ||
+        is.na(posterior_name) ||
+        !nzchar(posterior_name)) {
         return(NULL)
     }
+    posterior_name <- as.character(posterior_name)
 
-    draw_path <- file.path(draw_dir, paste0(posterior_name, ".json.zip"))
+    explicit_reference_name <- posterior[["reference_posterior_name"]]
+    is_null_link <- is.null(explicit_reference_name)
+    if (!is_null_link &&
+        (length(explicit_reference_name) != 1L ||
+         !is.character(explicit_reference_name) ||
+         is.na(explicit_reference_name) ||
+         !nzchar(explicit_reference_name))) {
+        return(data.frame(
+            posterior_name = posterior_name,
+            reference_posterior_name = NA_character_,
+            expected_reference_name = NA_character_,
+            posterior_file = path,
+            reference_info_file = NA_character_,
+            reference_draw_file = NA_character_,
+            reference_info_exists = FALSE,
+            reference_draw_exists = FALSE,
+            reference_info_name = NA_character_,
+            info_name_matches = FALSE,
+            issue_type = "invalid_reference_name",
+            auto_fix = auto_fix,
+            fixed = FALSE,
+            fix_status = "not_auto_fixed",
+            fix_error = NA_character_,
+            stringsAsFactors = FALSE
+        ))
+    }
+
+    reference_name <- if (is_null_link) {
+        posterior_name
+    } else {
+        as.character(explicit_reference_name)
+    }
+    draw_path <- file.path(draw_dir, paste0(reference_name, ".json.zip"))
     info_path <- file.path(
         reference_info_dir,
-        paste0(posterior_name, ".info.json")
+        paste0(reference_name, ".info.json")
     )
-    reference_info <- if (file.exists(info_path)) {
+    draw_exists <- file.exists(draw_path)
+    info_exists <- file.exists(info_path)
+    reference_info <- if (info_exists) {
         read_json_safely(info_path)
     } else {
         NULL
@@ -130,37 +167,58 @@ results <- lapply(posterior_files, function(path) {
     } else {
         NA_character_
     }
-    info_name_matches <- identical(reference_info_name, posterior_name)
-    draw_exists <- file.exists(draw_path)
-    info_exists <- file.exists(info_path)
-    safe_to_fix <- draw_exists && info_exists && info_name_matches
-    fixed <- FALSE
-    fix_status <- if (!draw_exists) {
-        "missing_draw_file"
-    } else if (!info_exists) {
-        "missing_reference_info"
-    } else if (is.null(reference_info)) {
-        "invalid_reference_info"
-    } else if (!info_name_matches) {
-        "reference_info_name_mismatch"
-    } else if (auto_fix) {
-        "pending_fix"
+    info_name_matches <- !is.na(reference_info_name) &&
+        identical(reference_info_name, reference_name)
+    complete_reference <- draw_exists && info_exists && info_name_matches
+
+    # A null link is valid when no reference material exists. If reference
+    # files do exist, report the mismatch and repair only a complete,
+    # canonical pair. Explicit non-null links are never guessed or rewritten.
+    if (is_null_link) {
+        if (!draw_exists && !info_exists) {
+            return(NULL)
+        }
+        issue_type <- if (complete_reference) {
+            "null_link_with_reference_files"
+        } else if (!draw_exists) {
+            "missing_reference_draw"
+        } else if (!info_exists) {
+            "missing_reference_info"
+        } else if (is.null(reference_info)) {
+            "invalid_reference_info"
+        } else {
+            "reference_info_name_mismatch"
+        }
     } else {
-        "fixable"
+        if (complete_reference) {
+            return(NULL)
+        }
+        issue_type <- if (!draw_exists) {
+            "missing_reference_draw"
+        } else if (!info_exists) {
+            "missing_reference_info"
+        } else if (is.null(reference_info)) {
+            "invalid_reference_info"
+        } else {
+            "reference_info_name_mismatch"
+        }
     }
+
+    fixed <- FALSE
+    fix_status <- if (is_null_link && complete_reference) "fixable" else "not_auto_fixed"
     fix_error <- NA_character_
 
-    if (auto_fix && safe_to_fix) {
+    if (auto_fix && is_null_link && complete_reference) {
         tryCatch(
             {
-                posterior[["reference_posterior_name"]] <- posterior_name
+                posterior[["reference_posterior_name"]] <- reference_name
                 write_json_atomically(posterior, path)
                 written <- read_json_safely(path)
                 if (
                     !is.list(written) ||
                         !identical(
                             written[["reference_posterior_name"]],
-                            posterior_name
+                            reference_name
                         )
                 ) {
                     stop("Round-trip verification failed.")
@@ -177,6 +235,8 @@ results <- lapply(posterior_files, function(path) {
 
     data.frame(
         posterior_name = posterior_name,
+        reference_posterior_name = if (is_null_link) NA_character_ else reference_name,
+        expected_reference_name = reference_name,
         posterior_file = path,
         reference_info_file = info_path,
         reference_draw_file = draw_path,
@@ -184,6 +244,7 @@ results <- lapply(posterior_files, function(path) {
         reference_draw_exists = draw_exists,
         reference_info_name = reference_info_name,
         info_name_matches = info_name_matches,
+        issue_type = issue_type,
         auto_fix = auto_fix,
         fixed = fixed,
         fix_status = fix_status,
@@ -197,6 +258,8 @@ results <- Filter(Negate(is.null), results)
 if (length(results) == 0L) {
     results <- data.frame(
         posterior_name = character(),
+        reference_posterior_name = character(),
+        expected_reference_name = character(),
         posterior_file = character(),
         reference_info_file = character(),
         reference_draw_file = character(),
@@ -204,6 +267,7 @@ if (length(results) == 0L) {
         reference_draw_exists = logical(),
         reference_info_name = character(),
         info_name_matches = logical(),
+        issue_type = character(),
         auto_fix = logical(),
         fixed = logical(),
         fix_status = character(),
@@ -214,14 +278,14 @@ if (length(results) == 0L) {
     results <- do.call(rbind, results)
 }
 
-# Keep the original scope: null metadata plus a matching draw archive.
-matches <- results[results$reference_draw_exists, , drop = FALSE]
+# Every row is an inconsistency; consistent explicit links were omitted above.
+matches <- results
 
 if (save_output) {
     write.csv(matches, output_file, row.names = FALSE)
-    message("Saved ", nrow(matches), " matching posterior(s) to ", output_file)
+    message("Saved ", nrow(matches), " inconsistent posterior(s) to ", output_file)
 } else if (nrow(matches) == 0L) {
-    message("No null reference_posterior_name entries have matching draws.")
+    message("No inconsistent reference_posterior_name entries were found.")
 } else {
     print(matches, row.names = FALSE)
 }
