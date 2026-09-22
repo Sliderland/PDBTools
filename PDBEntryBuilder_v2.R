@@ -1478,7 +1478,9 @@ PDBEntryBuilder <- R6::R6Class(
       overwrite = FALSE,
       continue_on_error = TRUE,
       save_failed_fits = FALSE,
-      failed_fit_dir = NULL
+      failed_fit_dir = NULL,
+      save_all_fits = FALSE,
+      all_fit_dir = NULL
     ) {
       flags <- list(
         register = register,
@@ -1486,7 +1488,8 @@ PDBEntryBuilder <- R6::R6Class(
         write = write,
         overwrite = overwrite,
         continue_on_error = continue_on_error,
-        save_failed_fits = save_failed_fits
+        save_failed_fits = save_failed_fits,
+        save_all_fits = save_all_fits
       )
       for (flag_name in names(flags)) {
         checkmate::assert_flag(flags[[flag_name]])
@@ -1494,38 +1497,44 @@ PDBEntryBuilder <- R6::R6Class(
       if (write && !sample) {
         stop("`write = TRUE` requires `sample = TRUE`.", call. = FALSE)
       }
-      if (save_failed_fits && !identical(self$stan_backend, "rstan")) {
-        stop("`save_failed_fits` requires the RStan backend.", call. = FALSE)
+      save_diagnostic_fits <- save_failed_fits || save_all_fits
+      if (save_diagnostic_fits && !identical(self$stan_backend, "rstan")) {
+        stop("Saving diagnostic fits requires the RStan backend.", call. = FALSE)
       }
-      if (save_failed_fits) {
+      # All-fit mode takes precedence when both flags are enabled. Each fit
+      # therefore has one RDS, in the all-fit directory.
+      diagnostic_fit_dir <- if (save_all_fits) all_fit_dir else failed_fit_dir
+      diagnostic_dir_arg <- if (save_all_fits) "all_fit_dir" else "failed_fit_dir"
+      if (save_diagnostic_fits) {
         if (
-          is.null(failed_fit_dir) ||
-            !is.character(failed_fit_dir) ||
-            length(failed_fit_dir) != 1L ||
-            is.na(failed_fit_dir) ||
-            !nzchar(failed_fit_dir)
+          is.null(diagnostic_fit_dir) ||
+            !is.character(diagnostic_fit_dir) ||
+            length(diagnostic_fit_dir) != 1L ||
+            is.na(diagnostic_fit_dir) ||
+            !nzchar(diagnostic_fit_dir)
         ) {
           stop(
-            "`failed_fit_dir` must be a non-empty path when `save_failed_fits = TRUE`.",
+            "`", diagnostic_dir_arg,
+            "` must be a non-empty path when diagnostic fits are enabled.",
             call. = FALSE
           )
         }
         dir.create(
-          failed_fit_dir,
+          diagnostic_fit_dir,
           recursive = TRUE,
           showWarnings = FALSE
         )
-        if (!dir.exists(failed_fit_dir)) {
+        if (!dir.exists(diagnostic_fit_dir)) {
           stop(
-            "Could not create `failed_fit_dir`.",
+            "Could not create `", diagnostic_dir_arg, "`.",
             call. = FALSE
           )
         }
       }
 
-      write_failed_fit <- function(fit, posterior_name) {
+      write_diagnostic_fit <- function(fit, posterior_name) {
         if (!inherits(fit, "stanfit")) {
-          stop("`save_failed_fits` requires an RStan `stanfit`.", call. = FALSE)
+          stop("Saving diagnostic fits requires an RStan `stanfit`.", call. = FALSE)
         }
 
         safe_name <- gsub(
@@ -1538,12 +1547,12 @@ PDBEntryBuilder <- R6::R6Class(
             safe_name, "_", format(Sys.time(), "%Y%m%d_%H%M%S"),
             "_pid", Sys.getpid(), "_"
           ),
-          tmpdir = failed_fit_dir,
+          tmpdir = diagnostic_fit_dir,
           fileext = ".rds"
         )
         partial_path <- paste0(fit_path, ".partial")
         on.exit(unlink(partial_path), add = TRUE)
-        message("Saving failed fit for ", posterior_name, " ...")
+        message("Saving diagnostic fit for ", posterior_name, " ...")
         saveRDS(fit, partial_path, compress = "gzip")
         if (!file.rename(partial_path, fit_path)) {
           stop("Could not finalize fit snapshot at ", fit_path, call. = FALSE)
@@ -1551,24 +1560,31 @@ PDBEntryBuilder <- R6::R6Class(
         fit_path
       }
 
-      save_failed_fit <- function(fit, posterior_name, reason) {
-        if (!save_failed_fits) {
+      save_diagnostic_fit <- function(fit, posterior_name, reason,
+                                      existing_path = NULL) {
+        if (!save_diagnostic_fits) {
           return(NULL)
         }
         if (is.null(fit)) {
           return(NULL)
         }
-        fit_path <- tryCatch(
-          write_failed_fit(fit, posterior_name),
-          error = function(e) {
-            save_failure <<- conditionMessage(e)
-            warning(
-              "Could not save failed fit for ", posterior_name, ": ",
-              save_failure, call. = FALSE
-            )
-            NULL
-          }
-        )
+        fit_path <- existing_path
+        if (!is.null(fit_path) && !file.exists(fit_path)) {
+          fit_path <- NULL
+        }
+        if (is.null(fit_path)) {
+          fit_path <- tryCatch(
+            write_diagnostic_fit(fit, posterior_name),
+            error = function(e) {
+              save_failure <<- conditionMessage(e)
+              warning(
+                "Could not save diagnostic fit for ", posterior_name, ": ",
+                save_failure, call. = FALSE
+              )
+              NULL
+            }
+          )
+        }
         if (is.null(fit_path)) {
           return(NULL)
         }
@@ -1593,7 +1609,14 @@ PDBEntryBuilder <- R6::R6Class(
             )
           }
         )
-        message("Saved failed fit for ", posterior_name, " to ", fit_path)
+        message(
+          if (identical(reason$status, "passed_checks")) {
+            "Saved diagnostic fit for "
+          } else {
+            "Saved failed fit for "
+          },
+          posterior_name, " to ", fit_path
+        )
         fit_path
       }
       if (!is.list(entries) || length(entries) == 0L) {
@@ -1659,7 +1682,7 @@ PDBEntryBuilder <- R6::R6Class(
         fit <- NULL
         posterior_object <- NULL
         posterior_name <- entry_name
-        failed_fit_path <- NULL
+        fit_rds_path <- NULL
         save_failure <- NULL
 
         message(
@@ -1791,11 +1814,11 @@ PDBEntryBuilder <- R6::R6Class(
               reference_args <- reference_spec
               reference_args$sampling_args <- NULL
               if (
-                save_failed_fits && !is.null(reference_args$backend) &&
+                save_diagnostic_fits && !is.null(reference_args$backend) &&
                   !identical(reference_args$backend, "rstan")
               ) {
                 stop(
-                  "`save_failed_fits` requires the RStan backend.",
+                  "Saving diagnostic fits requires the RStan backend.",
                   call. = FALSE
                 )
               }
@@ -1834,7 +1857,7 @@ PDBEntryBuilder <- R6::R6Class(
                   write = FALSE,
                   overwrite = entry_overwrite,
                   compute_diagnostics = FALSE,
-                  on_sampled = if (save_failed_fits) {
+                  on_sampled = if (save_diagnostic_fits) {
                     function(sampled_fit) {
                       fit <<- sampled_fit
                       message(
@@ -1893,7 +1916,7 @@ PDBEntryBuilder <- R6::R6Class(
               }
 
               if (length(failed_required_checks) > 0L) {
-                failed_fit_path <- save_failed_fit(
+                fit_rds_path <- save_diagnostic_fit(
                   fit,
                   posterior_name,
                   list(
@@ -1907,6 +1930,13 @@ PDBEntryBuilder <- R6::R6Class(
 
               if (length(failed_required_checks) == 0L) {
                 fit <- self$check_draws_from_stanfit(fit)
+                if (save_all_fits) {
+                  fit_rds_path <- save_diagnostic_fit(
+                    fit,
+                    posterior_name,
+                    list(status = "passed_checks")
+                  )
+                }
                 if (write) {
                   info_path <- self$write_rpi_from_stan_fit(
                     fit,
@@ -1957,18 +1987,24 @@ PDBEntryBuilder <- R6::R6Class(
               info_path = info_path,
               draws_path = draws_path,
               summary_paths = summary_paths,
-              failed_fit_path = failed_fit_path,
+              fit_rds_path = fit_rds_path,
+              failed_fit_path = if (length(failed_required_checks) > 0L) {
+                fit_rds_path
+              } else {
+                NULL
+              },
               error = NULL
             )
           },
           error = function(e) {
-            failed_fit_path <- save_failed_fit(
+            fit_rds_path <- save_diagnostic_fit(
               fit,
               if (is.null(posterior_name)) entry_name else posterior_name,
               list(
                 status = "error",
                 error = conditionMessage(e)
-              )
+              ),
+              existing_path = fit_rds_path
             )
             message(entry_name, " failed: ", conditionMessage(e))
             list(
@@ -1988,7 +2024,8 @@ PDBEntryBuilder <- R6::R6Class(
               info_path = NULL,
               draws_path = NULL,
               summary_paths = NULL,
-              failed_fit_path = failed_fit_path,
+              fit_rds_path = fit_rds_path,
+              failed_fit_path = fit_rds_path,
               error = conditionMessage(e)
             )
           },
@@ -1998,13 +2035,14 @@ PDBEntryBuilder <- R6::R6Class(
             # interrupt happens during checking or writing, retain the fit
             # before propagating the interrupt.  During Stan sampling `fit`
             # is still NULL, and there is no completed fit to serialize.
-            save_failed_fit(
+            save_diagnostic_fit(
               fit,
               if (is.null(posterior_name)) entry_name else posterior_name,
               list(
                 status = "interrupted",
                 error = conditionMessage(e)
-              )
+              ),
+              existing_path = fit_rds_path
             )
             stop(e)
           }
@@ -2013,7 +2051,7 @@ PDBEntryBuilder <- R6::R6Class(
 
         if (!is.null(save_failure)) {
           stop(
-            "Failed to save failed fit; stopping batch: ",
+            "Failed to save diagnostic fit; stopping batch: ",
             save_failure, call. = FALSE
           )
         }
@@ -2071,6 +2109,13 @@ PDBEntryBuilder <- R6::R6Class(
           results,
           function(x) x$written,
           logical(1)
+        ),
+        fit_rds_path = vapply(
+          results,
+          function(x) {
+            if (is.null(x$fit_rds_path)) NA_character_ else x$fit_rds_path
+          },
+          character(1)
         ),
         failed_fit_path = vapply(
           results,

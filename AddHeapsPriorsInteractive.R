@@ -36,6 +36,10 @@ save_failed_fits <- FALSE
 failed_fit_dir <- path.expand(
   "~/Documents/PDBTools_diagnostics/failed_reference_fits"
 )
+save_all_fits <- FALSE
+all_fit_dir <- path.expand(
+  "~/Documents/PDBTools_diagnostics/all_reference_fits"
+)
 
 pdb_path <- path.expand("~/Documents/posteriordb")
 heaps_program_path <- normalizePath("HeapsStanPrograms", mustWork = TRUE)
@@ -480,7 +484,9 @@ run_workflow_group <- function(entries, sampling_args, label) {
     overwrite = overwrite_reference_files,
     continue_on_error = continue_on_error,
     save_failed_fits = save_failed_fits,
-    failed_fit_dir = failed_fit_dir
+    failed_fit_dir = failed_fit_dir,
+    save_all_fits = save_all_fits,
+    all_fit_dir = all_fit_dir
   )
   summary <- entry$summarize_workflow_results(sampling)
   print(summary)

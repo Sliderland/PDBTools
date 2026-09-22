@@ -47,8 +47,12 @@ results <- entry$run_workflows(
     overwrite = TRUE,
     continue_on_error = TRUE,
     save_failed_fits = FALSE,
+    save_all_fits = FALSE,
     failed_fit_dir = path.expand(
         "~/Documents/PDBTools_diagnostics/failed_reference_fits"
+    ),
+    all_fit_dir = path.expand(
+        "~/Documents/PDBTools_diagnostics/all_reference_fits"
     )
 )
 

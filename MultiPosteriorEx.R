@@ -27,7 +27,11 @@ overwrite_existing <- TRUE
 continue_on_error <- TRUE
 save_failed_fits <- FALSE
 failed_fit_dir <- path.expand(
-    "~/Documents/PDBTools_diagnostics/failed_reference_fits"
+  "~/Documents/PDBTools_diagnostics/failed_reference_fits"
+)
+save_all_fits <- FALSE
+all_fit_dir <- path.expand(
+  "~/Documents/PDBTools_diagnostics/all_reference_fits"
 )
 
 if (write_reference_files && !run_sampling) {
@@ -243,7 +247,9 @@ batch_results <- entry$run_workflows(
     overwrite = overwrite_existing,
     continue_on_error = continue_on_error,
     save_failed_fits = save_failed_fits,
-    failed_fit_dir = failed_fit_dir
+    failed_fit_dir = failed_fit_dir,
+    save_all_fits = save_all_fits,
+    all_fit_dir = all_fit_dir
 )
 
 batch_summary <- entry$summarize_workflow_results(batch_results)
