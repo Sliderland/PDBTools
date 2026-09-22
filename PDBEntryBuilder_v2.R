@@ -1494,6 +1494,9 @@ PDBEntryBuilder <- R6::R6Class(
       if (write && !sample) {
         stop("`write = TRUE` requires `sample = TRUE`.", call. = FALSE)
       }
+      if (save_failed_fits && !identical(self$stan_backend, "rstan")) {
+        stop("`save_failed_fits` requires the RStan backend.", call. = FALSE)
+      }
       if (save_failed_fits) {
         if (
           is.null(failed_fit_dir) ||
@@ -1520,9 +1523,9 @@ PDBEntryBuilder <- R6::R6Class(
         }
       }
 
-      save_failed_fit <- function(fit, posterior_name, reason) {
-        if (!save_failed_fits || !inherits(fit, "stanfit")) {
-          return(NULL)
+      write_failed_fit <- function(fit, posterior_name) {
+        if (!inherits(fit, "stanfit")) {
+          stop("`save_failed_fits` requires an RStan `stanfit`.", call. = FALSE)
         }
 
         safe_name <- gsub(
@@ -1530,58 +1533,68 @@ PDBEntryBuilder <- R6::R6Class(
           "_",
           posterior_name
         )
-        stamp <- format(
-          Sys.time(),
-          "%Y%m%d_%H%M%S"
+        fit_path <- tempfile(
+          pattern = paste0(
+            safe_name, "_", format(Sys.time(), "%Y%m%d_%H%M%S"),
+            "_pid", Sys.getpid(), "_"
+          ),
+          tmpdir = failed_fit_dir,
+          fileext = ".rds"
         )
-        prefix <- file.path(
-          failed_fit_dir,
-          paste0(
-            safe_name,
-            "_",
-            stamp,
-            "_pid",
-            Sys.getpid()
-          )
-        )
-        fit_path <- paste0(prefix, ".rds")
-        diagnostic_path <- paste0(prefix, ".diagnostics.rds")
+        partial_path <- paste0(fit_path, ".partial")
+        on.exit(unlink(partial_path), add = TRUE)
+        message("Saving failed fit for ", posterior_name, " ...")
+        saveRDS(fit, partial_path, compress = "gzip")
+        if (!file.rename(partial_path, fit_path)) {
+          stop("Could not finalize fit snapshot at ", fit_path, call. = FALSE)
+        }
+        fit_path
+      }
 
-        saved <- tryCatch(
-          {
-            saveRDS(fit, fit_path, compress = "gzip")
-            saveRDS(
-              list(
-                posterior_name = posterior_name,
-                saved_at = Sys.time(),
-                reason = reason,
-                reference_info = self$get_reference_info(fit)
-              ),
-              diagnostic_path,
-              compress = "gzip"
-            )
-            message(
-              "Saved failed fit for ",
-              posterior_name,
-              " to ",
-              fit_path
-            )
-            fit_path
-          },
+      save_failed_fit <- function(fit, posterior_name, reason) {
+        if (!save_failed_fits) {
+          return(NULL)
+        }
+        if (is.null(fit)) {
+          return(NULL)
+        }
+        fit_path <- tryCatch(
+          write_failed_fit(fit, posterior_name),
           error = function(e) {
+            save_failure <<- conditionMessage(e)
             warning(
-              paste0(
-                "Could not save failed fit for ",
-                posterior_name,
-                ": ",
-                conditionMessage(e)
-              ),
-              call. = FALSE
+              "Could not save failed fit for ", posterior_name, ": ",
+              save_failure, call. = FALSE
             )
             NULL
           }
         )
-        saved
+        if (is.null(fit_path)) {
+          return(NULL)
+        }
+
+        diagnostic_path <- sub("\\.rds$", ".diagnostics.rds", fit_path)
+        tryCatch(
+          saveRDS(
+            list(
+              posterior_name = posterior_name,
+              saved_at = Sys.time(),
+              reason = reason,
+              reference_info = self$get_reference_info(fit)
+            ),
+            diagnostic_path,
+            compress = "gzip"
+          ),
+          error = function(e) {
+            warning(
+              "Fit saved at ", fit_path,
+              ", but diagnostics metadata could not be saved: ",
+              conditionMessage(e), call. = FALSE
+            )
+          }
+        )
+        message("Saved failed fit for ", posterior_name, " to ", fit_path)
+        fit_path
       }
       if (!is.list(entries) || length(entries) == 0L) {
         stop("`entries` must be a non-empty list.", call. = FALSE)
@@ -1646,6 +1659,8 @@ PDBEntryBuilder <- R6::R6Class(
         fit <- NULL
         posterior_object <- NULL
         posterior_name <- entry_name
+        failed_fit_path <- NULL
+        save_failure <- NULL
 
         message(
           "Starting workflow ",
@@ -1760,7 +1775,6 @@ PDBEntryBuilder <- R6::R6Class(
             info_path <- NULL
             draws_path <- NULL
             summary_paths <- NULL
-            failed_fit_path <- NULL
 
             if (sample) {
               if (
@@ -1776,6 +1790,15 @@ PDBEntryBuilder <- R6::R6Class(
               }
               reference_args <- reference_spec
               reference_args$sampling_args <- NULL
+              if (
+                save_failed_fits && !is.null(reference_args$backend) &&
+                  !identical(reference_args$backend, "rstan")
+              ) {
+                stop(
+                  "`save_failed_fits` requires the RStan backend.",
+                  call. = FALSE
+                )
+              }
               allowed_reference_args <- setdiff(
                 names(formals(self$compute_reference_draws)),
                 c(
@@ -1784,7 +1807,8 @@ PDBEntryBuilder <- R6::R6Class(
                   "auto_check",
                   "write",
                   "overwrite",
-                  "compute_diagnostics"
+                  "compute_diagnostics",
+                  "on_sampled"
                 )
               )
               unknown_reference_args <- setdiff(
@@ -1809,7 +1833,18 @@ PDBEntryBuilder <- R6::R6Class(
                   auto_check = FALSE,
                   write = FALSE,
                   overwrite = entry_overwrite,
-                  compute_diagnostics = FALSE
+                  compute_diagnostics = FALSE,
+                  on_sampled = if (save_failed_fits) {
+                    function(sampled_fit) {
+                      fit <<- sampled_fit
+                      message(
+                        "Sampling returned a fit for ", posterior_name,
+                        "; checking diagnostics."
+                      )
+                    }
+                  } else {
+                    NULL
+                  }
                 ),
                 reference_args
               )
@@ -1976,6 +2011,13 @@ PDBEntryBuilder <- R6::R6Class(
         )
         results[[i]] <- result
 
+        if (!is.null(save_failure)) {
+          stop(
+            "Failed to save failed fit; stopping batch: ",
+            save_failure, call. = FALSE
+          )
+        }
+
         if (
           identical(result$status, "error") &&
             !continue_on_error
@@ -2061,13 +2103,17 @@ PDBEntryBuilder <- R6::R6Class(
       write = FALSE,
       overwrite = FALSE,
       backend = self$stan_backend,
-      compute_diagnostics = TRUE
+      compute_diagnostics = TRUE,
+      on_sampled = NULL
     ) {
       if (!auto_check && write) {
         stop("Can't write draws without checking them first.")
       }
       posterior_objects <- self$get_posterior_modeldata(posterior_name)
       backend <- match.arg(backend, c("rstan", "cmdstanr"))
+      if (!is.null(on_sampled) && !is.function(on_sampled)) {
+        stop("`on_sampled` must be a function or NULL.", call. = FALSE)
+      }
       sa <- list(data = posterior_objects$data)
       if (is.null(control_args)) {
         inference <- sampling_args
@@ -2090,6 +2136,9 @@ PDBEntryBuilder <- R6::R6Class(
           posterior_objects$stan_model$sample,
           c(list(data = posterior_objects$data), cmdstan_args)
         )
+      }
+      if (!is.null(on_sampled)) {
+        on_sampled(stan_fit)
       }
       stan_fit <- self$set_fit_model_name(stan_fit, posterior_name)
       stan_fit <- self$set_reference_info(
