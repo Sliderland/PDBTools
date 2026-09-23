@@ -4,9 +4,7 @@ functions {
   /* Function to transform A to P (inverse of part 2 of reparameterisation) */
   matrix AtoP(matrix A) {
     int m = rows(A);
-    matrix[m, m] B = tcrossprod(A);
-    for (i in 1 : m) 
-      B[i, i] += 1.0;
+    matrix[m, m] B = identity_matrix(m) + tcrossprod(A);
     return mdivide_left_tri_low(cholesky_decompose(B), A);
   }
   /* Function to perform the reverse mapping from the Appendix. The details of
@@ -31,9 +29,7 @@ functions {
     Ll_for[p + 1] = cholesky_decompose(Sigma);
     for (s in 1 : p) {
       // In this block of code L_rev is B^{-1} and L_for is a working matrix
-      L_for = -tcrossprod(P[p - s + 1]);
-      for (i in 1 : m) 
-        L_for[i, i] += 1.0;
+      L_for = identity_matrix(m) - tcrossprod(P[p - s + 1]);
       L_rev = cholesky_decompose(L_for);
       Ll_for[p - s + 1] = mdivide_right_tri_low(Ll_for[p - s + 2], L_rev);
       Sigma_for[p - s + 1] = tcrossprod(Ll_for[p - s + 1]);
@@ -77,9 +73,15 @@ data {
 }
 transformed data {
   vector[p * m] y1top; // y_1, ..., y_p
-  vector[m] mu = rep_vector(0.0, m); // (Zero)-mean of VAR process
-  for (t in 1 : p) 
+  matrix[N - p, p * m] lag_design;
+  matrix[N - p, m] y_rest;
+  for (t in 1 : p)
     y1top[((t - 1) * m + 1) : (t * m)] = y[t];
+  for (t in (p + 1) : N) {
+    y_rest[t - p] = y[t]';
+    for (i in 1 : p)
+      lag_design[t - p, ((i - 1) * m + 1) : (i * m)] = y[t - i]';
+  }
 }
 parameters {
   array[p] matrix[m, m] A; // The A_i
@@ -108,19 +110,17 @@ transformed parameters {
   }
 }
 model {
-  vector[p * m] mut_init; // Marginal mean of (y_1^T, ..., y_p^T)^T
-  array[N - p] vector[m] mut_rest; // Conditional means of y_{p+1}, ..., y_{N}
+  vector[p * m] mut_init = rep_vector(0.0, p * m); // Marginal mean of (y_1^T, ..., y_p^T)^T
+  matrix[p * m, m] B = rep_matrix(0.0, p * m, m);
+  matrix[m, m] L_Sigma = cholesky_decompose(Sigma);
+  matrix[m, N - p] conditional_residuals;
+  for (i in 1 : p)
+    B[((i - 1) * m + 1) : (i * m),  : ] = phi[i]';
+  conditional_residuals = (y_rest - lag_design * B)';
   // Likelihood:
-  for (t in 1 : p) 
-    mut_init[((t - 1) * m + 1) : (t * m)] = mu;
-  for (t in (p + 1) : N) {
-    mut_rest[t - p] = mu;
-    for (i in 1 : p) {
-      mut_rest[t - p] += phi[i] * (y[t - i] - mu);
-    }
-  }
-  y1top ~ multi_normal(mut_init, Gamma);
-  y[(p + 1) : N] ~ multi_normal(mut_rest, Sigma);
+  y1top ~ multi_normal_cholesky(mut_init, cholesky_decompose(Gamma));
+  target += -0.5 * dot_self(to_vector(mdivide_left_tri_low(L_Sigma, conditional_residuals)))
+            - (N - p) * sum(log(diagonal(L_Sigma)));
 }
 generated quantities {
   matrix[m, m * p] topblock;
