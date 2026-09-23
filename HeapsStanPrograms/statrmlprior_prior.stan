@@ -12,25 +12,11 @@ functions {
     matrix[m, m] eprod = diag_post_multiply(evecs, root_root_evals);
     return tcrossprod(eprod);
   }
-  /* Function to map unconstrained C to positive definite V and orthogonal Q. The details
-     of the mapping are given in Section S3 of the Supplementary Materials.
-     Returned: a 2-dimensional array of (m x m) matrices; the 1st component
-               of the array is V and the 2nd component is Q. */
-  array[] matrix CtoVQ(matrix C) {
-    int m = rows(C);
-    matrix[m, m] Dsq = diag_matrix(singular_values(C) .^ 2);
-    matrix[m, m] U = svd_U(C);
-    matrix[m, m] V = svd_V(C);
-    array[2] matrix[m, m] VQ;
-    VQ[1] = V * Dsq * V'; // V
-    VQ[2] = V * U'; // Q
-    return VQ;
-  }
   /* Function to perform Algorithm [VQ] from Roy et al. (2019).
      Returned: a (2 x p) array of (m x m) matrices; the (1, i)-th component
                of the array is phi_i and the (2, i)-th component of the array
                is Gamma_{i-1} (assuming M = Sigma) */
-  array[,] matrix rev_mapping(array[] matrix V, array[] matrix Q, matrix M) {
+  array[,] matrix rev_mapping(array[] matrix C, array[] matrix V, matrix M) {
     int p = size(V);
     int m = rows(M);
     array[p + 1] matrix[m, m] U;
@@ -46,7 +32,7 @@ functions {
     } // U(0)
     Uunder[1][1 : m, 1 : m] = U[1];
     D[1] = U[1];
-    U[2] = sqrtm(V[1]) * Q[1] * sqrtm(U[1]); // U(1), etc.
+    U[2] = C[1]' * sqrtm(U[1]); // U(1), etc.
     eps[1][1 : m,  : ] = U[2]';
     kappa[1][1 : m,  : ] = U[2];
     D[2] = U[1]
@@ -63,7 +49,7 @@ functions {
         U[i + 1] = eps[i - 1][1 : end,  : ]'
                    * mdivide_left_spd(Uunder[i - 1][1 : end, 1 : end],
                                       kappa[i - 1][1 : end,  : ])
-                   + sqrtm(V[i]) * Q[i] * sqrtm(D[i]);
+                   + C[i]' * sqrtm(D[i]);
         eps[i][1 : end,  : ] = eps[i - 1][1 : end,  : ];
         eps[i][(end + 1) : (end + m),  : ] = U[i + 1]';
         kappa[i][1 : m,  : ] = U[i + 1];
@@ -96,15 +82,18 @@ data {
   array[N] vector[m] y; // Time series
 }
 transformed data {
-  vector[p * m] y_1top; // y_1, ..., y_p
-  vector[m] mu = rep_vector(0.0, m); // (Zero)-mean of VAR process
   matrix[m, m] identity; // Identity matrix
-  real df;
-
-  df = m + 4;
+  real df = m + 4;
   vector[p * m] y1top;
-  for (t in 1 : p) 
+  matrix[N - p, p * m] lag_design;
+  matrix[N - p, m] y_rest;
+  for (t in 1 : p)
     y1top[((t - 1) * m + 1) : (t * m)] = y[t];
+  for (t in (p + 1) : N) {
+    y_rest[t - p] = y[t]';
+    for (i in 1 : p)
+      lag_design[t - p, ((i - 1) * m + 1) : (i * m)] = y[t - i]';
+  }
   identity = diag_matrix(rep_vector(1.0, m));
 }
 parameters {
@@ -115,16 +104,12 @@ transformed parameters {
   array[p] matrix[m, m] phi; // The phi_i
   cov_matrix[p * m] Gamma; // (Stationary) variance of (y_1, ..., y_p)
   {
-    array[2] matrix[m, m] VQ;
     array[p] matrix[m, m] V;
-    array[p] matrix[m, m] Q;
     array[2, p] matrix[m, m] phiGamma;
     for (i in 1 : p) {
-      VQ = CtoVQ(C[i]);
-      V[i] = VQ[1];
-      Q[i] = VQ[2];
+      V[i] = C[i]' * C[i];
     }
-    phiGamma = rev_mapping(V, Q, Sigma);
+    phiGamma = rev_mapping(C, V, Sigma);
     phi = phiGamma[1];
     for (i in 1 : p) {
       for (j in 1 : p) {
@@ -139,19 +124,17 @@ transformed parameters {
   }
 }
 model {
-  vector[p * m] mut_init; // Marginal mean of (y_1^T, ..., y_p^T)^T
-  array[N - p] vector[m] mut_rest; // Conditional means of y_{p+1}, ..., y_{N}
+  vector[p * m] mut_init = rep_vector(0.0, p * m); // Marginal mean of (y_1^T, ..., y_p^T)^T
+  matrix[p * m, m] B = rep_matrix(0.0, p * m, m);
+  matrix[m, m] L_Sigma = cholesky_decompose(Sigma);
+  matrix[m, N - p] conditional_residuals;
+  for (i in 1 : p)
+    B[((i - 1) * m + 1) : (i * m),  : ] = phi[i]';
+  conditional_residuals = (y_rest - lag_design * B)';
   // Likelihood:
-  for (t in 1 : p) 
-    mut_init[((t - 1) * m + 1) : (t * m)] = mu;
-  for (t in (p + 1) : N) {
-    mut_rest[t - p] = mu;
-    for (i in 1 : p) {
-      mut_rest[t - p] += phi[i] * (y[t - i] - mu);
-    }
-  }
-  y1top ~ multi_normal(mut_init, Gamma);
-  y[(p + 1) : N] ~ multi_normal(mut_rest, Sigma);
+  y1top ~ multi_normal_cholesky(mut_init, cholesky_decompose(Gamma));
+  target += -0.5 * dot_self(to_vector(mdivide_left_tri_low(L_Sigma, conditional_residuals)))
+            - (N - p) * sum(log(diagonal(L_Sigma)));
   // Prior:
   Sigma ~ inv_wishart(df, identity);
   for (i in 1 : p) 
