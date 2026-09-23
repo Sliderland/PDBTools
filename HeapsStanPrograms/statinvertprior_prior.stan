@@ -7,8 +7,10 @@ functions {
     // Use the principal symmetric square root. The extra square root in
     // `root_root_evals` is required because `tcrossprod` squares the factors.
     matrix[m, m] A_sym = 0.5 * (A + A');
-    vector[m] root_root_evals = sqrt(sqrt(eigenvalues_sym(A_sym)));
-    matrix[m, m] evecs = eigenvectors_sym(A_sym);
+    matrix[m, m] evecs;
+    vector[m] evals;
+    (evecs, evals) = eigendecompose_sym(A_sym);
+    vector[m] root_root_evals = sqrt(sqrt(evals));
     matrix[m, m] eprod = diag_post_multiply(evecs, root_root_evals);
     return tcrossprod(eprod);
   }
@@ -140,7 +142,7 @@ data {
   int<lower=1> m; // Dimension of observation vector
   int<lower=1> p; // Order of VAR component
   int<lower=1> q; // Order of VMA component
-  int<lower=1> N; // Length of time series
+  int<lower=q+1> N; // Length of time series; recursion requires N > q
   array[N] vector[m] y; // Time series
 }
 transformed data {
@@ -175,7 +177,7 @@ transformed data {
   }
 }
 parameters {
-  vector[m * (p + q)] init; // (y_0^T, ..., y_{1-p}^T, eps_0^T, ..., eps_{1-q}^T)^T
+  vector[m * (p + q)] z_init; // Whitened stationary initial state
   array[p] matrix[m, m] A; // The A_i
   array[q] matrix[m, m] D; // The D_i
   cov_matrix[m] Sigma; // Error variance, Sigma
@@ -192,6 +194,7 @@ transformed parameters {
   array[p] matrix[m, m] phi; // The phi_i
   array[q] matrix[m, m] theta; // The theta_i
   cov_matrix[(p + q) * m] Omega; // Variance in initial distribution, i.e. Gamma0_tilde
+  vector[m * (p + q)] init; // (y_0^T, ..., y_{1-p}^T, eps_0^T, ..., eps_{1-q}^T)^T
   array[N + p] vector[m] yfull; // (y_{1-p}^T, ..., y_{N}^T)^T
   array[q] vector[m] epsinit; // (eps_0^T, ..., eps_{1-q}^T)^T
   {
@@ -206,6 +209,8 @@ transformed parameters {
     for (i in 1 : q) 
       theta[i] = -theta[i];
     Omega = initial_joint_var(Sigma, phi, theta);
+    // The process mean mu is fixed at zero in transformed data.
+    init = cholesky_decompose(Omega) * z_init;
     for (i in 1 : p) {
       yfull[i] = init[((p - i) * m + 1) : ((p - i + 1) * m)]; // y[1-p],...,y[0]
     }
@@ -216,13 +221,9 @@ transformed parameters {
   }
 }
 model {
-  vector[(p + q) * m] mut_init; /* Marginal mean of 
-                                   (y_0, ..., y_{1-p}, eps_0, ..., eps_{1-q}) */
+  matrix[m, m] L_Sigma = cholesky_decompose(Sigma);
   array[N] vector[m] mut; // Conditional means of y_{1}, ..., y_{N}
   // (Complete data) likelihood:
-  for (t in 1 : p) 
-    mut_init[((t - 1) * m + 1) : (t * m)] = mu;
-  mut_init[(p * m + 1) : ((p + q) * m)] = rep_vector(0.0, q * m);
   mut[1] = mu;
   for (i in 1 : p) {
     mut[1] += phi[i] * (yfull[p + 1 - i] - mu);
@@ -253,8 +254,8 @@ model {
       mut[t] += theta[i] * (yfull[p + t - i] - mut[t - i]);
     }
   }
-  init ~ multi_normal(mut_init, Omega);
-  y ~ multi_normal(mut, Sigma);
+  z_init ~ std_normal();
+  y ~ multi_normal_cholesky(mut, L_Sigma);
   // Prior:
   Sigma ~ inv_wishart(df, scale_mat);
   for (s in 1 : p) {
@@ -302,4 +303,3 @@ generated quantities {
   vector[m * p] lambda_moduli = abs(lambdas);
   real max_lambda_modulus = max(lambda_moduli);
 }
-
