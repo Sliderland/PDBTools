@@ -132,9 +132,14 @@ summary_root <- function(pdb_path) {
 
 read_draw_archive <- function(archive_path) {
   members <- unzip(archive_path, list = TRUE)$Name
-  json_member <- members[
-    grepl("\\.json$", members, ignore.case = TRUE)
-  ]
+  expected_member <- sub("\\.zip$", "", basename(archive_path))
+  json_member <- members[members == expected_member]
+  if (length(json_member) == 0L) {
+    json_member <- members[
+      grepl("\\.json$", members, ignore.case = TRUE) &
+        !grepl("(^|/)__MACOSX(/|$)|(^|/)\\._", members)
+    ]
+  }
 
   if (length(json_member) != 1L) {
     stop(
@@ -159,7 +164,12 @@ read_draw_archive <- function(archive_path) {
 
 read_reference_metadata <- function(info_path) {
   info <- jsonlite::read_json(info_path, simplifyVector = FALSE)
-  variable_names <- info$diagnostics$diagnostic_information$names
+  diagnostic_information <- info$diagnostics$diagnostic_information
+  if (is.null(diagnostic_information)) {
+    # Some existing PosteriorDB metadata uses the plural spelling.
+    diagnostic_information <- info$diagnostics$diagnostics_information
+  }
+  variable_names <- diagnostic_information$names
   number_of_chains <- as.integer(
     info$inference$method_arguments$chains
   )
