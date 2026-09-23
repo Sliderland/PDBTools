@@ -91,21 +91,29 @@ compute_3d_density <- function(
 
     values <- as.vector(density$estimate)
     grid <- expand.grid(density$eval.points)
-    finite <- is.finite(values) & values > 0
+    finite <- is.finite(values)
 
     if (sum(finite) < 10L) {
         stop("The 3D density estimate did not contain enough finite values.")
     }
 
-    values <- values[finite]
-    grid <- grid[finite, , drop = FALSE]
+    # Keep the complete regular grid. Removing zero/underflow cells makes the
+    # coordinates irregular, which prevents Plotly's isosurface trace from
+    # reconstructing the 3D surface reliably. Non-finite estimates are safe
+    # to represent as zero-density cells.
+    values[!finite] <- 0
+    positive_values <- values[values > 0]
+    if (length(positive_values) < 10L) {
+        stop("The 3D density estimate did not contain enough positive values.")
+    }
+
     list(
         x = grid[[1L]],
         y = grid[[2L]],
         z = grid[[3L]],
         value = values,
-        isomin = as.numeric(stats::quantile(values, 0.65)),
-        isomax = max(values),
+        isomin = as.numeric(stats::quantile(positive_values, 0.65)),
+        isomax = max(positive_values),
         surface_count = 4L
     )
 }
