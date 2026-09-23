@@ -162,6 +162,188 @@ get_cached_3d_density <- function(
 }
 
 
+# Read a local PosteriorDB reference-draw archive without requiring its
+# diagnostic metadata.  This is useful for older/local archives whose
+# metadata predates fields expected by the current posteriordb package.
+read_pdb_reference_draws <- function(
+    pdb_path,
+    reference_posterior_name
+) {
+    pdb_path <- path.expand(pdb_path)
+    if (!dir.exists(pdb_path)) {
+        stop("PosteriorDB path does not exist: ", pdb_path)
+    }
+
+    if (
+        length(reference_posterior_name) != 1L ||
+            is.na(reference_posterior_name) ||
+            !nzchar(reference_posterior_name)
+    ) {
+        stop("`reference_posterior_name` must be one non-empty string.")
+    }
+
+    archive_path <- file.path(
+        pdb_path,
+        "posterior_database",
+        "reference_posteriors",
+        "draws",
+        "draws",
+        paste0(reference_posterior_name, ".json.zip")
+    )
+    info_path <- file.path(
+        pdb_path,
+        "posterior_database",
+        "reference_posteriors",
+        "draws",
+        "info",
+        paste0(reference_posterior_name, ".info.json")
+    )
+
+    if (!file.exists(archive_path)) {
+        stop(
+            "Reference-draw archive not found for `",
+            reference_posterior_name,
+            "`: ",
+            archive_path
+        )
+    }
+
+    if (!file.exists(info_path)) {
+        stop(
+            "Reference-draw metadata not found for `",
+            reference_posterior_name,
+            "`: ",
+            info_path
+        )
+    }
+
+    reference_info <- jsonlite::read_json(
+        info_path,
+        simplifyVector = FALSE
+    )
+    variable_names <- reference_info$diagnostics$
+        diagnostic_information$names
+
+    if (is.null(variable_names) || length(variable_names) == 0L) {
+        stop(
+            "Reference-draw metadata does not contain variable names: ",
+            info_path
+        )
+    }
+
+    archive_members <- unzip(archive_path, list = TRUE)$Name
+    json_member <- archive_members[
+        grepl("\\.json$", archive_members, ignore.case = TRUE)
+    ]
+
+    if (length(json_member) != 1L) {
+        stop(
+            "Expected exactly one JSON member in reference-draw archive: ",
+            archive_path
+        )
+    }
+
+    extraction_dir <- tempfile("pdb_reference_draws_")
+    dir.create(extraction_dir)
+    on.exit(unlink(extraction_dir, recursive = TRUE), add = TRUE)
+
+    unzip(
+        archive_path,
+        files = json_member,
+        exdir = extraction_dir,
+        junkpaths = TRUE
+    )
+    json_path <- file.path(extraction_dir, basename(json_member))
+
+    raw_draws <- jsonlite::read_json(
+        json_path,
+        simplifyVector = FALSE
+    )
+
+    dimensions <- c(
+        length(raw_draws),
+        length(raw_draws[[1L]]),
+        length(raw_draws[[1L]][[1L]])
+    )
+    number_of_chains <- reference_info$inference$
+        method_arguments$chains
+    number_of_chains <- as.integer(number_of_chains)
+
+    if (
+        length(number_of_chains) != 1L ||
+            is.na(number_of_chains) ||
+            number_of_chains < 1L
+    ) {
+        stop("Reference-draw metadata does not contain a valid chain count.")
+    }
+
+    if (
+        dimensions[1L] == number_of_chains &&
+            dimensions[2L] == length(variable_names)
+    ) {
+        # Standard PosteriorDB layout: chain x variable x iteration.
+        values <- aperm(
+            array(
+                unlist(raw_draws, use.names = FALSE),
+                dim = c(
+                    dimensions[3L],
+                    dimensions[2L],
+                    dimensions[1L]
+                )
+            ),
+            perm = c(1L, 3L, 2L)
+        )
+    } else if (
+        dimensions[2L] == number_of_chains &&
+            dimensions[3L] == length(variable_names)
+    ) {
+        # Heaps archives in this local database: iteration x chain x variable.
+        values <- aperm(
+            array(
+                unlist(raw_draws, use.names = FALSE),
+                dim = dimensions[c(3L, 2L, 1L)]
+            ),
+            perm = c(3L, 2L, 1L)
+        )
+    } else {
+        stop(
+            "Could not reconcile draw archive dimensions ",
+            paste(dimensions, collapse = " x "),
+            " with ",
+            number_of_chains,
+            " chains and ",
+            length(variable_names),
+            " variables."
+        )
+    }
+
+    dimnames(values) <- list(
+        iteration = as.character(seq_len(dim(values)[1L])),
+        chain = as.character(seq_len(dim(values)[2L])),
+        variable = variable_names
+    )
+
+    posterior::as_draws_array(values)
+}
+
+
+launch_pdb_reference_3d <- function(
+    pdb_path,
+    reference_posterior_name,
+    max_points = 5000
+) {
+    draws <- read_pdb_reference_draws(
+        pdb_path = pdb_path,
+        reference_posterior_name = reference_posterior_name
+    )
+
+    launch_draws_3d(
+        draws = draws,
+        max_points = max_points
+    )
+}
+
+
 launch_stan_3d <- function(fit) {
     library(shiny)
     library(plotly)
