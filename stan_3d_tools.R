@@ -376,29 +376,36 @@ read_pdb_github_reference_draws <- function(
     archive_path <- file.path(draw_dir, archive_name)
     info_path <- file.path(info_dir, info_name)
 
-    # `pdb_file_copy` is an internal posteriordb transport generic.  Using it
-    # here keeps GitHub authentication, repository refs, and rate-limit-aware
-    # behavior in posteriordb while keeping draw parsing in this file.
-    archive_downloaded <- posteriordb:::pdb_file_copy(
+    # Use posteriordb's persistent connection cache so repeated launches do
+    # not repeatedly call the GitHub API or redownload the same large archive.
+    archive_cached_path <- posteriordb:::pdb_cached_local_file_path(
         pdb,
-        from = file.path(
+        file.path(
             "reference_posteriors",
             "draws",
             "draws",
             archive_name
         ),
-        to = archive_path,
-        overwrite = TRUE
+        unzip = FALSE
     )
-    info_downloaded <- posteriordb:::pdb_file_copy(
+    info_cached_path <- posteriordb:::pdb_cached_local_file_path(
         pdb,
-        from = file.path(
+        file.path(
             "reference_posteriors",
             "draws",
             "info",
             info_name
         ),
-        to = info_path,
+        unzip = FALSE
+    )
+    archive_downloaded <- file.copy(
+        archive_cached_path,
+        archive_path,
+        overwrite = TRUE
+    )
+    info_downloaded <- file.copy(
+        info_cached_path,
+        info_path,
         overwrite = TRUE
     )
 
