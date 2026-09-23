@@ -614,7 +614,7 @@ launch_stan_3d <- function(fit) {
                         marker = list(
                             size = input$size,
                             opacity = input$opacity
-                        ),
+                        )
                     )
             }
 
@@ -1624,7 +1624,7 @@ launch_draws_3d <- function(
                             opacity = input$draws_opacity
                         ),
                         text = hover_text,
-                        hoverinfo = "text",
+                        hoverinfo = "text"
                     )
             }
 
