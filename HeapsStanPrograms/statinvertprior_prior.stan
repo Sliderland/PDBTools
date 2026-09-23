@@ -128,7 +128,7 @@ data {
   int<lower=1> m; // Dimension of observation vector
   int<lower=1> p; // Order of VAR component
   int<lower=1> q; // Order of VMA component
-  int<lower=q+1> N; // Length of time series; recursion requires N > q
+  int<lower=q> N; // Length of time series; N = q uses only initialized errors
   array[N] vector[m] y; // Time series
 }
 transformed data {
