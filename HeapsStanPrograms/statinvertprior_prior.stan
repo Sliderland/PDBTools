@@ -79,35 +79,21 @@ functions {
      (y_0, ..., y_{1-p}, eps_0, ..., eps_{1-q}). Details of the underpinning
      ideas are given in Section S7 of the Supplementary Materials. */
   matrix initial_joint_var(matrix Sigma, array[] matrix phi,
-                           array[] matrix theta) {
+                           array[] matrix theta, matrix companion_shift) {
     int p = size(phi);
     int q = size(theta);
     int m = rows(Sigma);
     int state_dim = (p + q) * m;
-    matrix[(p + q) * m, (p + q) * m] companion_mat = rep_matrix(0.0,
-                                                                (p + q) * m,
-                                                                (p + q) * m);
+    matrix[state_dim, state_dim] companion_mat = companion_shift;
     matrix[(p + q) * m, (p + q) * m] companion_var = rep_matrix(0.0,
                                                                 (p + q) * m,
                                                                 (p + q) * m);
     // Construct phi_tilde:
     for (i in 1 : p) {
       companion_mat[1 : m, ((i - 1) * m + 1) : (i * m)] = phi[i];
-      if (i > 1) {
-        for (j in 1 : m) {
-          companion_mat[(i - 1) * m + j, (i - 2) * m + j] = 1.0;
-        }
-      }
     }
     for (i in 1 : q) {
       companion_mat[1 : m, ((p + i - 1) * m + 1) : ((p + i) * m)] = theta[i];
-    }
-    if (q > 1) {
-      for (i in 2 : q) {
-        for (j in 1 : m) {
-          companion_mat[(p + i - 1) * m + j, (p + i - 2) * m + j] = 1.0;
-        }
-      }
     }
     // Construct Sigma_tilde:
     companion_var[1 : m, 1 : m] = Sigma;
@@ -148,6 +134,8 @@ data {
 transformed data {
   vector[m] mu = rep_vector(0.0, m); // (Zero)-mean of VARMA process
   matrix[m, m] scale_mat; // Scale-matrix in prior for Sigma
+  matrix[(p + q) * m, (p + q) * m] companion_shift = rep_matrix(
+    0.0, (p + q) * m, (p + q) * m);
   array[2] vector[2] es;
   array[2] vector[2] fs;
   array[2] vector[2] gs;
@@ -167,6 +155,16 @@ transformed data {
   scale_diag = 1.0;
   scale_offdiag = 0.0;
   df = m + 4;
+  // The state shifts depend only on dimensions, so build them once.
+  if (p > 1) {
+    companion_shift[(m + 1) : (p * m), 1 : ((p - 1) * m)] =
+      identity_matrix((p - 1) * m);
+  }
+  if (q > 1) {
+    companion_shift[((p + 1) * m + 1) : ((p + q) * m),
+                    (p * m + 1) : ((p + q - 1) * m)] =
+      identity_matrix((q - 1) * m);
+  }
   for (i in 1 : m) {
     for (j in 1 : m) {
       if (i == j) 
@@ -208,7 +206,7 @@ transformed parameters {
     theta = rev_mapping(R, Sigma);
     for (i in 1 : q) 
       theta[i] = -theta[i];
-    Omega = initial_joint_var(Sigma, phi, theta);
+    Omega = initial_joint_var(Sigma, phi, theta, companion_shift);
     // The process mean mu is fixed at zero in transformed data.
     init = cholesky_decompose(Omega) * z_init;
     for (i in 1 : p) {
