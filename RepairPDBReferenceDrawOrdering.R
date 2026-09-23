@@ -13,6 +13,10 @@
 #
 # Apply repairs (creates a .bak-TIMESTAMP archive first):
 #   Rscript RepairPDBReferenceDrawOrdering.R --apply
+#
+# Write a repaired, standalone copy instead of changing the source tree:
+#   Rscript RepairPDBReferenceDrawOrdering.R \
+#     --apply --output-pdb-path=~/Documents/posteriordb_repaired
 
 suppressPackageStartupMessages({
   library(jsonlite)
@@ -22,6 +26,7 @@ suppressPackageStartupMessages({
 parse_args <- function(args) {
   options <- list(
     pdb_path = path.expand("~/Documents/posteriordb"),
+    output_pdb_path = NULL,
     posterior_name = NULL,
     apply = FALSE,
     backup = TRUE,
@@ -35,6 +40,10 @@ parse_args <- function(args) {
       options$backup <- FALSE
     } else if (grepl("^--pdb-path=", arg)) {
       options$pdb_path <- path.expand(sub("^--pdb-path=", "", arg))
+    } else if (grepl("^--output-pdb-path=", arg)) {
+      options$output_pdb_path <- path.expand(
+        sub("^--output-pdb-path=", "", arg)
+      )
     } else if (grepl("^--posterior-name=", arg)) {
       options$posterior_name <- sub("^--posterior-name=", "", arg)
     } else if (grepl("^--report=", arg)) {
@@ -45,13 +54,60 @@ parse_args <- function(args) {
   }
 
   if (is.null(options$report)) {
+    report_root <- if (is.null(options$output_pdb_path)) {
+      options$pdb_path
+    } else {
+      options$output_pdb_path
+    }
     options$report <- file.path(
-      options$pdb_path,
+      report_root,
       "reference_draw_order_audit.csv"
     )
   }
 
   options
+}
+
+copy_pdb_tree <- function(source_path, destination_path) {
+  if (dir.exists(destination_path)) {
+    existing <- list.files(
+      destination_path,
+      all.files = TRUE,
+      no.. = TRUE,
+      recursive = TRUE,
+      full.names = TRUE
+    )
+    if (length(existing) > 0L) {
+      stop(
+        "Output PDB path already exists and is not empty: ",
+        destination_path,
+        call. = FALSE
+      )
+    }
+  } else if (!dir.create(destination_path, recursive = TRUE)) {
+    stop("Could not create output PDB path: ", destination_path, call. = FALSE)
+  }
+
+  files <- list.files(
+    source_path,
+    all.files = TRUE,
+    recursive = TRUE,
+    full.names = TRUE,
+    include.dirs = FALSE
+  )
+  files <- files[!file.info(files)$isdir]
+  for (source_file in files) {
+    relative_file <- substring(
+      source_file,
+      nchar(normalizePath(source_path, mustWork = TRUE)) + 2L
+    )
+    destination_file <- file.path(destination_path, relative_file)
+    dir.create(dirname(destination_file), recursive = TRUE, showWarnings = FALSE)
+    if (!file.copy(source_file, destination_file, overwrite = FALSE)) {
+      stop("Could not copy: ", source_file, call. = FALSE)
+    }
+  }
+  invisible(destination_path)
 }
 
 reference_root <- function(pdb_path) {
@@ -370,19 +426,47 @@ main <- function() {
   if (!dir.exists(options$pdb_path)) {
     stop("PosteriorDB path does not exist: ", options$pdb_path, call. = FALSE)
   }
+  if (!is.null(options$output_pdb_path) && !options$apply) {
+    stop(
+      "--output-pdb-path requires --apply; use a dry run without it first.",
+      call. = FALSE
+    )
+  }
+
+  working_pdb_path <- options$pdb_path
+  if (!is.null(options$output_pdb_path)) {
+    source_path <- normalizePath(options$pdb_path, mustWork = TRUE)
+    output_parent <- dirname(options$output_pdb_path)
+    dir.create(output_parent, recursive = TRUE, showWarnings = FALSE)
+    output_path <- normalizePath(
+      options$output_pdb_path,
+      mustWork = FALSE
+    )
+    if (identical(source_path, output_path)) {
+      stop("Output PDB path must differ from the source path.", call. = FALSE)
+    }
+    message("Copying source PosteriorDB tree to: ", output_path)
+    copy_pdb_tree(source_path, output_path)
+    working_pdb_path <- output_path
+  }
 
   message(
-    if (options$apply) "Applying reference-draw repairs." else
+    if (!is.null(options$output_pdb_path)) {
+      "Applying repairs to the copied PosteriorDB tree."
+    } else if (options$apply) {
+      "Applying reference-draw repairs in place."
+    } else {
       "Dry run: no reference-draw archives will be changed."
+    }
   )
   draw_report <- audit_and_maybe_repair(
-    pdb_path = options$pdb_path,
+    pdb_path = working_pdb_path,
     posterior_name = options$posterior_name,
     apply = options$apply,
     backup = options$backup
   )
   summary_report <- audit_summaries(
-    pdb_path = options$pdb_path,
+    pdb_path = working_pdb_path,
     posterior_name = options$posterior_name
   )
 
