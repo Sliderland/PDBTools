@@ -305,6 +305,9 @@ audit_summaries <- function(pdb_path, posterior_name = NULL) {
     recursive = TRUE,
     full.names = TRUE
   )
+  # Summary metadata files describe the summary type; they are not summary
+  # vectors and therefore do not need the names/length consistency check.
+  paths <- paths[!grepl("\\.info\\.json$", paths, ignore.case = TRUE)]
 
   if (!is.null(posterior_name)) {
     paths <- paths[basename(paths) == paste0(posterior_name, ".json")]
