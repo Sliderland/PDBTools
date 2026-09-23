@@ -43,6 +43,125 @@ get_diagnostics_df <- function(fit, inc_warmup = FALSE) {
 }
 
 
+# Build a Plotly-compatible 3D kernel-density isosurface.  The density is
+# deliberately computed only when a caller requests it, because KDE is much
+# more expensive than drawing the posterior points.
+compute_3d_density <- function(
+    draw_data,
+    x_variable,
+    y_variable,
+    z_variable,
+    grid_size = 25L,
+    max_kde_points = 20000L
+) {
+    if (!requireNamespace("ks", quietly = TRUE)) {
+        stop("Package `ks` is required for 3D density plots.")
+    }
+
+    coordinates <- draw_data[, c(x_variable, y_variable, z_variable),
+                             drop = FALSE]
+    coordinates <- coordinates[
+        apply(coordinates, 1L, function(row) all(is.finite(row))),
+        ,
+        drop = FALSE
+    ]
+
+    if (nrow(coordinates) < 20L) {
+        stop("At least 20 finite draws are required for a 3D density plot.")
+    }
+
+    if (any(vapply(coordinates, function(x) diff(range(x)) == 0, logical(1)))) {
+        stop("A 3D density cannot be computed when an axis is constant.")
+    }
+
+    if (nrow(coordinates) > max_kde_points) {
+        coordinates <- coordinates[
+            sample.int(nrow(coordinates), max_kde_points),
+            ,
+            drop = FALSE
+        ]
+    }
+
+    grid_size <- as.integer(grid_size)
+    density <- ks::kde(
+        x = as.matrix(coordinates),
+        gridsize = rep(grid_size, 3L),
+        binned = TRUE
+    )
+
+    values <- as.vector(density$estimate)
+    grid <- expand.grid(density$eval.points)
+    finite <- is.finite(values) & values > 0
+
+    if (sum(finite) < 10L) {
+        stop("The 3D density estimate did not contain enough finite values.")
+    }
+
+    values <- values[finite]
+    grid <- grid[finite, , drop = FALSE]
+    list(
+        x = grid[[1L]],
+        y = grid[[2L]],
+        z = grid[[3L]],
+        value = values,
+        isomin = as.numeric(stats::quantile(values, 0.65)),
+        isomax = max(values),
+        surface_count = 4L
+    )
+}
+
+
+add_density_trace <- function(plot, density, name, color) {
+    plot |>
+        plotly::add_trace(
+            x = density$x,
+            y = density$y,
+            z = density$z,
+            value = density$value,
+            type = "isosurface",
+            name = paste(name, "density"),
+            isomin = density$isomin,
+            isomax = density$isomax,
+            surface = list(count = density$surface_count),
+            opacity = 0.35,
+            colorscale = list(
+                list(0, color),
+                list(1, color)
+            ),
+            showscale = FALSE,
+            hoverinfo = "skip"
+        )
+}
+
+
+get_cached_3d_density <- function(
+    cache,
+    cache_key,
+    draw_data,
+    x_variable,
+    y_variable,
+    z_variable,
+    grid_size
+) {
+    if (exists(cache_key, envir = cache, inherits = FALSE)) {
+        return(get(cache_key, envir = cache, inherits = FALSE))
+    }
+
+    density <- tryCatch(
+        compute_3d_density(
+            draw_data,
+            x_variable,
+            y_variable,
+            z_variable,
+            grid_size = grid_size
+        ),
+        error = function(error) error
+    )
+    assign(cache_key, density, envir = cache)
+    density
+}
+
+
 launch_stan_3d <- function(fit) {
     library(shiny)
     library(plotly)
@@ -115,6 +234,22 @@ launch_stan_3d <- function(fit) {
                     }
                 ),
 
+                radioButtons(
+                    "display_mode",
+                    "Display",
+                    choices = c("Scatter", "Density", "Both"),
+                    selected = "Scatter"
+                ),
+
+                sliderInput(
+                    "density_grid",
+                    "Density grid resolution",
+                    min = 15,
+                    max = 40,
+                    value = 25,
+                    step = 1
+                ),
+
                 sliderInput(
                     "opacity",
                     "Point opacity",
@@ -166,28 +301,64 @@ launch_stan_3d <- function(fit) {
             once = TRUE
         )
 
+        density_cache <- new.env(parent = emptyenv())
+
         output$posterior_plot <- renderPlotly({
             req(input$x, input$y, input$z)
 
-            colour_variable <- if (input$colour == "Divergence") {
-                plot_data$divergence
-            } else {
-                factor(plot_data$.chain)
+            show_scatter <- input$display_mode %in% c("Scatter", "Both")
+            show_density <- input$display_mode %in% c("Density", "Both")
+            plot <- plotly::plot_ly()
+
+            if (show_scatter) {
+                colour_variable <- if (input$colour == "Divergence") {
+                    plot_data$divergence
+                } else {
+                    factor(plot_data$.chain)
+                }
+
+                plot <- plot |>
+                    plotly::add_trace(
+                        x = plot_data[[input$x]],
+                        y = plot_data[[input$y]],
+                        z = plot_data[[input$z]],
+                        color = colour_variable,
+                        type = "scatter3d",
+                        mode = "markers",
+                        marker = list(
+                            size = input$size,
+                            opacity = input$opacity
+                        ),
+                        name = "Draws"
+                    )
             }
 
-            plot_ly(
-                x = plot_data[[input$x]],
-                y = plot_data[[input$y]],
-                z = plot_data[[input$z]],
-                color = colour_variable,
-                type = "scatter3d",
-                mode = "markers",
-                marker = list(
-                    size = input$size,
-                    opacity = input$opacity
+            if (show_density) {
+                density <- get_cached_3d_density(
+                    density_cache,
+                    paste(input$x, input$y, input$z, input$density_grid, sep = "|"),
+                    plot_data,
+                    input$x,
+                    input$y,
+                    input$z,
+                    input$density_grid
                 )
-            ) |>
-                layout(
+                validate(
+                    shiny::need(
+                        !inherits(density, "error"),
+                        paste("Density unavailable:", density$message)
+                    )
+                )
+                plot <- add_density_trace(
+                    plot,
+                    density,
+                    "Posterior",
+                    "#2563EB"
+                )
+            }
+
+            plot |>
+                plotly::layout(
                     scene = list(
                         xaxis = list(title = input$x),
                         yaxis = list(title = input$y),
@@ -301,7 +472,25 @@ launch_fit_comparison <- function(fit1, fit2) {
                 ),
 
                 checkboxInput("show_fit1", "Show Fit 1", value = TRUE),
-                checkboxInput("show_fit2", "Show Fit 2", value = TRUE)
+                checkboxInput("show_fit2", "Show Fit 2", value = TRUE),
+                checkboxInput(
+                    "show_density1",
+                    "Show Fit 1 density",
+                    value = FALSE
+                ),
+                checkboxInput(
+                    "show_density2",
+                    "Show Fit 2 density",
+                    value = FALSE
+                ),
+                sliderInput(
+                    "density_grid",
+                    "Density grid resolution",
+                    min = 15,
+                    max = 40,
+                    value = 25,
+                    step = 1
+                )
             ),
 
             mainPanel(
@@ -374,6 +563,8 @@ launch_fit_comparison <- function(fit1, fit2) {
             }
         })
 
+        density_cache <- new.env(parent = emptyenv())
+
         output$posterior_plot <- renderPlotly({
             req(input$x1, input$x2, input$y1, input$y2, input$z1, input$z2)
 
@@ -412,6 +603,31 @@ launch_fit_comparison <- function(fit1, fit2) {
                     )
             }
 
+            if (isTRUE(input$show_density1)) {
+                density1 <- get_cached_3d_density(
+                    density_cache,
+                    paste("fit1", input$x1, input$y1, input$z1,
+                          input$density_grid, sep = "|"),
+                    draws1,
+                    input$x1,
+                    input$y1,
+                    input$z1,
+                    input$density_grid
+                )
+                validate(
+                    need(
+                        !inherits(density1, "error"),
+                        paste("Fit 1 density unavailable:", density1$message)
+                    )
+                )
+                plot <- add_density_trace(
+                    plot,
+                    density1,
+                    "Fit 1",
+                    "#2563EB"
+                )
+            }
+
             if (input$show_fit2) {
                 plot <- plot |>
                     add_trace(
@@ -443,6 +659,31 @@ launch_fit_comparison <- function(fit1, fit2) {
                         ),
                         hoverinfo = "text"
                     )
+            }
+
+            if (isTRUE(input$show_density2)) {
+                density2 <- get_cached_3d_density(
+                    density_cache,
+                    paste("fit2", input$x2, input$y2, input$z2,
+                          input$density_grid, sep = "|"),
+                    draws2,
+                    input$x2,
+                    input$y2,
+                    input$z2,
+                    input$density_grid
+                )
+                validate(
+                    need(
+                        !inherits(density2, "error"),
+                        paste("Fit 2 density unavailable:", density2$message)
+                    )
+                )
+                plot <- add_density_trace(
+                    plot,
+                    density2,
+                    "Fit 2",
+                    "#DC2626"
+                )
             }
 
             plot |>
@@ -602,6 +843,12 @@ launch_multi_fit_comparison <- function(
                             paste0("show_", i),
                             paste("Show", fit_names[i]),
                             value = TRUE
+                        ),
+
+                        checkboxInput(
+                            paste0("show_density_", i),
+                            paste("Show density", fit_names[i]),
+                            value = FALSE
                         )
                     )
                 }),
@@ -620,6 +867,15 @@ launch_multi_fit_comparison <- function(
                     min = 0.05,
                     max = 1,
                     value = 0.45
+                ),
+
+                sliderInput(
+                    "density_grid",
+                    "Density grid resolution",
+                    min = 15,
+                    max = 40,
+                    value = 25,
+                    step = 1
                 )
             ),
 
@@ -686,12 +942,19 @@ launch_multi_fit_comparison <- function(
             )
         })
 
+        density_cache <- new.env(parent = emptyenv())
+
         output$posterior_plot <- renderPlotly({
             plot <- plot_ly()
             visible_fits <- 0L
 
             for (i in seq_len(number_of_fits)) {
-                if (!isTRUE(input[[paste0("show_", i)]])) {
+                show_scatter <- isTRUE(input[[paste0("show_", i)]])
+                show_density <- isTRUE(
+                    input[[paste0("show_density_", i)]]
+                )
+
+                if (!show_scatter && !show_density) {
                     next
                 }
 
@@ -725,22 +988,59 @@ launch_multi_fit_comparison <- function(
                     draw_data$.iteration
                 )
 
-                plot <- plot |>
-                    add_trace(
-                        x = draw_data[[x_variable]],
-                        y = draw_data[[y_variable]],
-                        z = draw_data[[z_variable]],
-                        type = "scatter3d",
-                        mode = "markers",
-                        name = fit_names[i],
-                        marker = list(
-                            size = input$point_size,
-                            opacity = input$opacity,
-                            color = fit_colors[i]
+                if (show_scatter) {
+                    plot <- plot |>
+                        add_trace(
+                            x = draw_data[[x_variable]],
+                            y = draw_data[[y_variable]],
+                            z = draw_data[[z_variable]],
+                            type = "scatter3d",
+                            mode = "markers",
+                            name = fit_names[i],
+                            marker = list(
+                                size = input$point_size,
+                                opacity = input$opacity,
+                                color = fit_colors[i]
+                            ),
+                            text = hover_text,
+                            hoverinfo = "text"
+                        )
+                }
+
+                if (show_density) {
+                    density <- get_cached_3d_density(
+                        density_cache,
+                        paste(
+                            i,
+                            x_variable,
+                            y_variable,
+                            z_variable,
+                            input$density_grid,
+                            sep = "|"
                         ),
-                        text = hover_text,
-                        hoverinfo = "text"
+                        draw_data,
+                        x_variable,
+                        y_variable,
+                        z_variable,
+                        input$density_grid
                     )
+                    validate(
+                        need(
+                            !inherits(density, "error"),
+                            paste(
+                                fit_names[i],
+                                "density unavailable:",
+                                density$message
+                            )
+                        )
+                    )
+                    plot <- add_density_trace(
+                        plot,
+                        density,
+                        fit_names[i],
+                        fit_colors[i]
+                    )
+                }
 
                 visible_fits <- visible_fits + 1L
             }
@@ -823,6 +1123,22 @@ launch_draws_3d <- function(
                     "Colour points by",
                     choices = colour_choices,
                     selected = colour_choices[1]
+                ),
+
+                shiny::radioButtons(
+                    "draws_display_mode",
+                    "Display",
+                    choices = c("Scatter", "Density", "Both"),
+                    selected = "Scatter"
+                ),
+
+                shiny::sliderInput(
+                    "draws_density_grid",
+                    "Density grid resolution",
+                    min = 15,
+                    max = 40,
+                    value = 25,
+                    step = 1
                 ),
 
                 shiny::sliderInput(
@@ -963,54 +1279,102 @@ launch_draws_3d <- function(
             plot_data
         })
 
+        density_cache <- new.env(parent = emptyenv())
+
         output$draws_posterior_plot <- plotly::renderPlotly({
             plot_data <- selected_draws()
 
-            colour_variable <- if (
-                has_divergences &&
-                    identical(input$draws_colour, "Divergence")
-            ) {
-                factor(
-                    plot_data$divergent__,
-                    levels = c(0, 1),
-                    labels = c("Regular", "Divergent")
+            show_scatter <- input$draws_display_mode %in% c(
+                "Scatter",
+                "Both"
+            )
+            show_density <- input$draws_display_mode %in% c(
+                "Density",
+                "Both"
+            )
+            plot <- plotly::plot_ly()
+
+            if (show_scatter) {
+                colour_variable <- if (
+                    has_divergences &&
+                        identical(input$draws_colour, "Divergence")
+                ) {
+                    factor(
+                        plot_data$divergent__,
+                        levels = c(0, 1),
+                        labels = c("Regular", "Divergent")
+                    )
+                } else {
+                    factor(plot_data$.chain)
+                }
+
+                hover_text <- paste0(
+                    input$draws_x,
+                    ": ",
+                    signif(plot_data[[input$draws_x]], 4),
+                    "<br>",
+                    input$draws_y,
+                    ": ",
+                    signif(plot_data[[input$draws_y]], 4),
+                    "<br>",
+                    input$draws_z,
+                    ": ",
+                    signif(plot_data[[input$draws_z]], 4),
+                    "<br>Chain: ",
+                    plot_data$.chain,
+                    "<br>Iteration: ",
+                    plot_data$.iteration
                 )
-            } else {
-                factor(plot_data$.chain)
+
+                plot <- plot |>
+                    plotly::add_trace(
+                        x = plot_data[[input$draws_x]],
+                        y = plot_data[[input$draws_y]],
+                        z = plot_data[[input$draws_z]],
+                        color = colour_variable,
+                        type = "scatter3d",
+                        mode = "markers",
+                        marker = list(
+                            size = input$draws_size,
+                            opacity = input$draws_opacity
+                        ),
+                        text = hover_text,
+                        hoverinfo = "text",
+                        name = "Draws"
+                    )
             }
 
-            hover_text <- paste0(
-                input$draws_x,
-                ": ",
-                signif(plot_data[[input$draws_x]], 4),
-                "<br>",
-                input$draws_y,
-                ": ",
-                signif(plot_data[[input$draws_y]], 4),
-                "<br>",
-                input$draws_z,
-                ": ",
-                signif(plot_data[[input$draws_z]], 4),
-                "<br>Chain: ",
-                plot_data$.chain,
-                "<br>Iteration: ",
-                plot_data$.iteration
-            )
+            if (show_density) {
+                density <- get_cached_3d_density(
+                    density_cache,
+                    paste(
+                        input$draws_x,
+                        input$draws_y,
+                        input$draws_z,
+                        input$draws_density_grid,
+                        sep = "|"
+                    ),
+                    plot_data,
+                    input$draws_x,
+                    input$draws_y,
+                    input$draws_z,
+                    input$draws_density_grid
+                )
+                shiny::validate(
+                    shiny::need(
+                        !inherits(density, "error"),
+                        paste("Density unavailable:", density$message)
+                    )
+                )
+                plot <- add_density_trace(
+                    plot,
+                    density,
+                    "Posterior",
+                    "#2563EB"
+                )
+            }
 
-            plotly::plot_ly(
-                x = plot_data[[input$draws_x]],
-                y = plot_data[[input$draws_y]],
-                z = plot_data[[input$draws_z]],
-                color = colour_variable,
-                type = "scatter3d",
-                mode = "markers",
-                marker = list(
-                    size = input$draws_size,
-                    opacity = input$draws_opacity
-                ),
-                text = hover_text,
-                hoverinfo = "text"
-            ) |>
+            plot |>
                 plotly::layout(
                     scene = list(
                         xaxis = list(title = input$draws_x),
