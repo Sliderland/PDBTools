@@ -344,6 +344,103 @@ launch_pdb_reference_3d <- function(
 }
 
 
+read_pdb_github_reference_draws <- function(
+    pdb,
+    reference_posterior_name
+) {
+    if (!inherits(pdb, "pdb_github")) {
+        stop("`pdb` must be a posteriordb `pdb_github` connection.")
+    }
+
+    temporary_root <- tempfile("pdb_github_reference_")
+    draw_dir <- file.path(
+        temporary_root,
+        "posterior_database",
+        "reference_posteriors",
+        "draws",
+        "draws"
+    )
+    info_dir <- file.path(
+        temporary_root,
+        "posterior_database",
+        "reference_posteriors",
+        "draws",
+        "info"
+    )
+    dir.create(draw_dir, recursive = TRUE)
+    dir.create(info_dir, recursive = TRUE)
+    on.exit(unlink(temporary_root, recursive = TRUE), add = TRUE)
+
+    archive_name <- paste0(reference_posterior_name, ".json.zip")
+    info_name <- paste0(reference_posterior_name, ".info.json")
+    archive_path <- file.path(draw_dir, archive_name)
+    info_path <- file.path(info_dir, info_name)
+
+    # `pdb_file_copy` is an internal posteriordb transport generic.  Using it
+    # here keeps GitHub authentication, repository refs, and rate-limit-aware
+    # behavior in posteriordb while keeping draw parsing in this file.
+    archive_downloaded <- posteriordb:::pdb_file_copy(
+        pdb,
+        from = file.path(
+            "reference_posteriors",
+            "draws",
+            "draws",
+            archive_name
+        ),
+        to = archive_path,
+        overwrite = TRUE
+    )
+    info_downloaded <- posteriordb:::pdb_file_copy(
+        pdb,
+        from = file.path(
+            "reference_posteriors",
+            "draws",
+            "info",
+            info_name
+        ),
+        to = info_path,
+        overwrite = TRUE
+    )
+
+    if (!isTRUE(archive_downloaded) || !file.exists(archive_path)) {
+        stop(
+            "Could not download reference-draw archive for `",
+            reference_posterior_name,
+            "` from the GitHub PosteriorDB connection."
+        )
+    }
+    if (!isTRUE(info_downloaded) || !file.exists(info_path)) {
+        stop(
+            "Could not download reference-draw metadata for `",
+            reference_posterior_name,
+            "` from the GitHub PosteriorDB connection."
+        )
+    }
+
+    read_pdb_reference_draws(
+        pdb_path = temporary_root,
+        reference_posterior_name = reference_posterior_name
+    )
+}
+
+
+launch_pdb_github_reference_3d <- function(
+    pdb,
+    reference_posterior_name,
+    max_points = 5000
+) {
+    draws <- read_pdb_github_reference_draws(
+        pdb = pdb,
+        reference_posterior_name = reference_posterior_name
+    )
+
+    launch_draws_3d(
+        draws = draws,
+        max_points = max_points
+    )
+}
+
+
 launch_stan_3d <- function(fit) {
     library(shiny)
     library(plotly)
