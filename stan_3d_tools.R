@@ -119,6 +119,91 @@ compute_3d_density <- function(
 }
 
 
+# Estimate a two-dimensional posterior density for a smooth z = f(x, y)
+# surface. This is intentionally separate from compute_3d_density(): the
+# third plotted axis is density, not a third posterior parameter.
+compute_2d_density_surface <- function(
+    draw_data,
+    x_variable,
+    y_variable,
+    grid_size = 50L,
+    max_kde_points = 20000L
+) {
+    if (!requireNamespace("ks", quietly = TRUE)) {
+        stop("Package `ks` is required for density surfaces.")
+    }
+
+    coordinates <- draw_data[, c(x_variable, y_variable), drop = FALSE]
+    coordinates <- coordinates[
+        apply(coordinates, 1L, function(row) all(is.finite(row))),
+        ,
+        drop = FALSE
+    ]
+
+    if (nrow(coordinates) < 20L) {
+        stop("At least 20 finite draws are required for a density surface.")
+    }
+
+    if (any(vapply(coordinates, function(x) diff(range(x)) == 0, logical(1)))) {
+        stop("A density surface cannot be computed when an axis is constant.")
+    }
+
+    if (nrow(coordinates) > max_kde_points) {
+        coordinates <- coordinates[
+            sample.int(nrow(coordinates), max_kde_points),
+            ,
+            drop = FALSE
+        ]
+    }
+
+    grid_size <- as.integer(grid_size)
+    density <- ks::kde(
+        x = as.matrix(coordinates),
+        gridsize = rep(grid_size, 2L),
+        binned = TRUE
+    )
+    values <- density$estimate
+    values[!is.finite(values)] <- 0
+
+    if (!any(values > 0)) {
+        stop("The 2D density estimate did not contain positive values.")
+    }
+
+    list(
+        x = density$eval.points[[1L]],
+        y = density$eval.points[[2L]],
+        z = values,
+        z_max = max(values)
+    )
+}
+
+
+get_cached_2d_density_surface <- function(
+    cache,
+    cache_key,
+    draw_data,
+    x_variable,
+    y_variable,
+    grid_size
+) {
+    if (exists(cache_key, envir = cache, inherits = FALSE)) {
+        return(get(cache_key, envir = cache, inherits = FALSE))
+    }
+
+    density <- tryCatch(
+        compute_2d_density_surface(
+            draw_data,
+            x_variable,
+            y_variable,
+            grid_size = grid_size
+        ),
+        error = function(error) error
+    )
+    assign(cache_key, density, envir = cache)
+    density
+}
+
+
 add_density_trace <- function(plot, density, name, color) {
     plot |>
         plotly::add_trace(
@@ -1361,6 +1446,168 @@ launch_multi_fit_comparison <- function(
 # Explore any posterior::draws object without first materializing every
 # parameter as a data frame. This is particularly useful for wide PosteriorDB
 # reference-draw objects.
+# Plot a two-parameter posterior density as a smooth z = f(x, y) surface.
+# The selected x and y parameters are the posterior coordinates; height is
+# their estimated joint density.
+launch_density_surface_3d <- function(
+    draws,
+    max_points = 20000
+) {
+    if (!posterior::is_draws(draws)) {
+        stop("`draws` must be a posterior::draws object.")
+    }
+
+    if (
+        length(max_points) != 1 ||
+            is.na(max_points) ||
+            max_points <= 0
+    ) {
+        stop("`max_points` must be a positive number or Inf.")
+    }
+
+    draw_variables <- posterior::variables(draws)
+    excluded <- c(".chain", ".iteration", ".draw", "lp__", "divergent__")
+    parameters <- draw_variables[
+        !draw_variables %in% excluded &
+            !grepl("__$", draw_variables)
+    ]
+
+    if (length(parameters) < 2L) {
+        stop("`draws` must contain at least two selectable variables.")
+    }
+
+    ui <- shiny::fluidPage(
+        shiny::titlePanel("Interactive posterior density surface"),
+        shiny::sidebarLayout(
+            shiny::sidebarPanel(
+                parameterInput("surface_x", "X parameter"),
+                parameterInput("surface_y", "Y parameter"),
+                shiny::sliderInput(
+                    "surface_grid",
+                    "Density grid resolution",
+                    min = 25,
+                    max = 80,
+                    value = 50,
+                    step = 1
+                ),
+                shiny::sliderInput(
+                    "surface_opacity",
+                    "Surface opacity",
+                    min = 0.1,
+                    max = 1,
+                    value = 0.85,
+                    step = 0.05
+                ),
+                shiny::helpText(
+                    paste0(
+                        posterior::ndraws(draws),
+                        " draws in ",
+                        posterior::nchains(draws),
+                        " chains. Height is estimated joint density."
+                    )
+                )
+            ),
+            shiny::mainPanel(
+                plotly::plotlyOutput("density_surface_plot", height = "750px")
+            )
+        )
+    )
+
+    server <- function(input, output, session) {
+        session$onFlushed(
+            function() {
+                shiny::updateSelectizeInput(
+                    session,
+                    "surface_x",
+                    choices = parameters,
+                    selected = parameters[1L],
+                    server = TRUE
+                )
+                shiny::updateSelectizeInput(
+                    session,
+                    "surface_y",
+                    choices = parameters,
+                    selected = parameters[2L],
+                    server = TRUE
+                )
+            },
+            once = TRUE
+        )
+
+        selected_draws <- shiny::reactive({
+            shiny::req(input$surface_x, input$surface_y)
+            selected_variables <- unique(c(input$surface_x, input$surface_y))
+            plot_data <- posterior::subset_draws(
+                draws,
+                variable = selected_variables
+            ) |>
+                posterior::as_draws_df() |>
+                as.data.frame()
+
+            if (is.finite(max_points) && nrow(plot_data) > max_points) {
+                plot_data <- plot_data[
+                    sample.int(nrow(plot_data), max_points),
+                    ,
+                    drop = FALSE
+                ]
+            }
+            plot_data
+        })
+
+        density_cache <- new.env(parent = emptyenv())
+
+        output$density_surface_plot <- plotly::renderPlotly({
+            plot_data <- selected_draws()
+            density <- get_cached_2d_density_surface(
+                density_cache,
+                paste(input$surface_x, input$surface_y, input$surface_grid, sep = "|"),
+                plot_data,
+                input$surface_x,
+                input$surface_y,
+                input$surface_grid
+            )
+            shiny::validate(
+                shiny::need(
+                    !inherits(density, "error"),
+                    paste("Density surface unavailable:", density$message)
+                )
+            )
+
+            plotly::plot_ly(
+                x = density$x,
+                y = density$y,
+                z = t(density$z),
+                type = "surface",
+                opacity = input$surface_opacity,
+                colorscale = list(
+                    list(0, "#DBEAFE"),
+                    list(1, "#1D4ED8")
+                ),
+                contours = list(
+                    z = list(
+                        show = TRUE,
+                        usecolormap = TRUE,
+                        highlightcolor = "#111827",
+                        project = list(z = TRUE)
+                    )
+                ),
+                showscale = TRUE,
+                colorbar = list(title = "Density")
+            ) |>
+                plotly::layout(
+                    scene = list(
+                        xaxis = list(title = input$surface_x),
+                        yaxis = list(title = input$surface_y),
+                        zaxis = list(title = "Estimated density")
+                    )
+                )
+        })
+    }
+
+    shiny::shinyApp(ui, server)
+}
+
+
 launch_draws_3d <- function(
     draws,
     max_points = 5000
