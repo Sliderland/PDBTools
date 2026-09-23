@@ -2403,7 +2403,16 @@ PDBEntryBuilder <- R6::R6Class(
         },
         add = TRUE
       )
-      jsonlite::write_json(draws, json_path, digits = NA, null = "null")
+      # PosteriorDB archives nest draws by chain, variable, then iteration.
+      # Keep the draws_array for checks and convert only for serialization.
+      draws_for_disk <- posterior::as_draws_list(draws)
+      jsonlite::write_json(
+        draws_for_disk,
+        json_path,
+        digits = NA,
+        null = "null"
+      )
+      rm(draws_for_disk)
       zip_status <- utils::zip(
         zipfile = temp_zip,
         files = json_path,
@@ -2459,7 +2468,12 @@ PDBEntryBuilder <- R6::R6Class(
       )
       list(
         info = jsonlite::read_json(info_path, simplifyVector = FALSE),
-        draws = jsonlite::read_json(extracted, simplifyVector = TRUE),
+        # Keep the outer nesting, but parse each iteration vector compactly.
+        draws = jsonlite::read_json(
+          extracted,
+          simplifyVector = TRUE,
+          simplifyMatrix = FALSE
+        ),
         archive_member = archive$Name[[1]]
       )
     },
@@ -2479,26 +2493,82 @@ PDBEntryBuilder <- R6::R6Class(
           call. = FALSE
         )
       }
-      loaded_values <- unlist(
-        loaded$draws,
-        recursive = TRUE,
+      expected_dims <- dim(expected_draws)
+      raw_draws <- loaded$draws
+      if (
+        !is.list(raw_draws) || length(raw_draws) == 0L ||
+          !is.list(raw_draws[[1L]]) || length(raw_draws[[1L]]) == 0L ||
+          !is.numeric(raw_draws[[1L]][[1L]])
+      ) {
+        stop("Reference-draw archive has an invalid structure.", call. = FALSE)
+      }
+      raw_dims <- c(
+        length(raw_draws),
+        length(raw_draws[[1L]]),
+        length(raw_draws[[1L]][[1L]])
+      )
+      if (
+        !all(lengths(raw_draws) == raw_dims[2L]) ||
+          !all(vapply(
+            raw_draws,
+            function(x) all(lengths(x) == raw_dims[3L]),
+            logical(1)
+          ))
+      ) {
+        stop("Reference-draw archive is not rectangular.", call. = FALSE)
+      }
+      expected_variables <- posterior::variables(expected_draws)
+      stored_variables <- unlist(
+        loaded$info$diagnostics$diagnostic_information$names,
         use.names = FALSE
       )
-      expected_values <- as.numeric(unclass(expected_draws))
-      if (length(loaded_values) != length(expected_values)) {
+      if (!identical(stored_variables, expected_variables)) {
+        stop(
+          "Reference-draw variable names or order changed during the write/read round trip.",
+          call. = FALSE
+        )
+      }
+      if (
+        length(raw_dims) != 3L ||
+          prod(raw_dims) != prod(expected_dims) ||
+          !(
+            identical(raw_dims, expected_dims[c(2L, 3L, 1L)]) ||
+              identical(raw_dims, expected_dims)
+          )
+      ) {
         stop(
           "Reference-draw dimensions changed during the write/read round trip.",
           call. = FALSE
         )
       }
-      if (
-        !isTRUE(all.equal(
-          as.numeric(loaded_values),
-          expected_values,
+
+      raw_values <- unlist(raw_draws, recursive = TRUE, use.names = FALSE)
+      matches_expected <- function(values) {
+        isTRUE(all.equal(
+          as.numeric(values),
+          as.numeric(expected_draws),
           tolerance = sqrt(.Machine$double.eps),
           check.attributes = FALSE
         ))
-      ) {
+      }
+      matches <- FALSE
+      if (identical(raw_dims, expected_dims[c(2L, 3L, 1L)])) {
+        # Standard archive: chain x variable x iteration.
+        standard <- aperm(
+          array(raw_values, dim = expected_dims[c(1L, 3L, 2L)]),
+          c(1L, 3L, 2L)
+        )
+        matches <- matches_expected(standard)
+      }
+      if (!matches && identical(raw_dims, expected_dims)) {
+        # Older PDBTools archives: iteration x chain x variable.
+        legacy <- aperm(
+          array(raw_values, dim = expected_dims[c(3L, 2L, 1L)]),
+          c(3L, 2L, 1L)
+        )
+        matches <- matches_expected(legacy)
+      }
+      if (!matches) {
         stop(
           "Reference-draw values changed during the write/read round trip.",
           call. = FALSE
