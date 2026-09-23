@@ -615,7 +615,6 @@ launch_stan_3d <- function(fit) {
                             size = input$size,
                             opacity = input$opacity
                         ),
-                        name = "Draws"
                     )
             }
 
@@ -1626,7 +1625,6 @@ launch_draws_3d <- function(
                         ),
                         text = hover_text,
                         hoverinfo = "text",
-                        name = "Draws"
                     )
             }
 
