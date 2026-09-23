@@ -99,33 +99,40 @@ data {
 }
 transformed data {
   vector[p * m] y_1top; // y_1, ..., y_p
-  vector[m] mu = rep_vector(0.0, m); // (Zero)-mean of VAR process
+  matrix[N - p, p * m] X; // Lag design matrix, with the most recent lag first
+  matrix[N - p, m] Y; // Conditional observations
+  array[m * (m - 1)] int offdiag_index; // Column-major linear indices
   matrix[m, m] scale_mat; // Scale-matrix in prior for Sigma
   vector[2] es;
   vector[2] fs;
   vector[2] gs;
   vector[2] hs;
-  real scale_diag;
-  real scale_offdiag;
   real df;
-  
+
   es = rep_vector(0.0, 2);
   fs = rep_vector(sqrt(0.455), 2);
   gs = rep_vector(1.365, 2);
   hs = rep_vector(0.071175, 2);
-  scale_diag = 1.0;
-  scale_offdiag = 0.0;
   df = m + 4;
-  for (t in 1 : p) 
-    y_1top[((t - 1) * m + 1) : (t * m)] = y[t];
-  for (i in 1 : m) {
+  for (n in 1 : (N - p)) {
+    Y[n] = y[p + n]';
+    for (lag in 1 : p)
+      X[n, ((lag - 1) * m + 1) : (lag * m)] = y[p + n - lag]';
+  }
+  {
+    int k = 1;
     for (j in 1 : m) {
-      if (i == j) 
-        scale_mat[i, j] = scale_diag;
-      else 
-        scale_mat[i, j] = scale_offdiag;
+      for (i in 1 : m) {
+        if (i != j) {
+          offdiag_index[k] = (j - 1) * m + i;
+          k += 1;
+        }
+      }
     }
   }
+  for (t in 1 : p)
+    y_1top[((t - 1) * m + 1) : (t * m)] = y[t];
+  scale_mat = identity_matrix(m);
 }
 parameters {
   array[p] matrix[m, m] A; // The A_i
@@ -158,29 +165,26 @@ transformed parameters {
   }
 }
 model {
-  vector[p * m] mut_init; // Marginal mean of (y_1^T, ..., y_p^T)^T
-  array[N - p] vector[m] mut_rest; // Conditional means of y_{p+1}, ..., y_{N}
+  matrix[p * m, m] B;
+  matrix[N - p, m] residual;
+  matrix[m, m] L_Sigma = cholesky_decompose(Sigma);
+  matrix[m, N - p] whitened;
+  matrix[p * m, p * m] L_Gamma = cholesky_decompose(Gamma);
+  real conditional_log_lik;
   // Likelihood:
-  for (t in 1 : p) 
-    mut_init[((t - 1) * m + 1) : (t * m)] = mu;
-  for (t in (p + 1) : N) {
-    mut_rest[t - p] = mu;
-    for (i in 1 : p) {
-      mut_rest[t - p] += phi[i] * (y[t - i] - mu);
-    }
-  }
-  y_1top ~ multi_normal(mut_init, Gamma);
-  y[(p + 1) : N] ~ multi_normal(mut_rest, Sigma);
+  for (lag in 1 : p)
+    B[((lag - 1) * m + 1) : (lag * m), ] = phi[lag]';
+  residual = Y - X * B;
+  whitened = mdivide_left_tri_low(L_Sigma, residual');
+  conditional_log_lik = -0.5 * (2 * (N - p) * sum(log(diagonal(L_Sigma)))
+                                + sum(square(whitened)));
+  target += conditional_log_lik;
+  target += multi_normal_cholesky_lupdf(y_1top | rep_vector(0.0, p * m), L_Gamma);
   // Prior:
   Sigma ~ inv_wishart(df, scale_mat);
   for (s in 1 : p) {
     diagonal(A[s]) ~ normal(Amu[1, s], 1 / sqrt(Aomega[1, s]));
-    for (i in 1 : m) {
-      for (j in 1 : m) {
-        if (i != j) 
-          A[s, i, j] ~ normal(Amu[2, s], 1 / sqrt(Aomega[2, s]));
-      }
-    }
+    to_vector(A[s])[offdiag_index] ~ normal(Amu[2, s], 1 / sqrt(Aomega[2, s]));
   }
   // Hyperprior:
   for (i in 1 : 2) {
