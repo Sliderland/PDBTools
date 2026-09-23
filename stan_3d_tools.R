@@ -1453,10 +1453,6 @@ launch_density_surface_3d <- function(
     draws,
     max_points = 20000
 ) {
-    if (!posterior::is_draws(draws)) {
-        stop("`draws` must be a posterior::draws object.")
-    }
-
     if (
         length(max_points) != 1 ||
             is.na(max_points) ||
@@ -1465,7 +1461,29 @@ launch_density_surface_3d <- function(
         stop("`max_points` must be a positive number or Inf.")
     }
 
-    draw_variables <- posterior::variables(draws)
+    is_stanfit <- inherits(draws, "stanfit")
+    if (!is_stanfit && !posterior::is_draws(draws)) {
+        stop("`draws` must be a posterior::draws object or an rstan stanfit.")
+    }
+
+    diagnostics <- NULL
+    if (is_stanfit) {
+        draw_variables <- draws@sim$fnames_oi
+        diagnostics <- posterior::as_draws_df(
+            rstan::get_sampler_params(draws, inc_warmup = FALSE)
+        ) |>
+            as.data.frame()
+        number_of_draws <- nrow(diagnostics)
+        number_of_chains <- length(rstan::get_sampler_params(
+            draws,
+            inc_warmup = FALSE
+        ))
+    } else {
+        draw_variables <- posterior::variables(draws)
+        number_of_draws <- posterior::ndraws(draws)
+        number_of_chains <- posterior::nchains(draws)
+    }
+
     excluded <- c(".chain", ".iteration", ".draw", "lp__", "divergent__")
     parameters <- draw_variables[
         !draw_variables %in% excluded &
@@ -1476,12 +1494,31 @@ launch_density_surface_3d <- function(
         stop("`draws` must contain at least two selectable variables.")
     }
 
+    has_divergences <- is_stanfit || "divergent__" %in% draw_variables
+    colour_choices <- if (has_divergences) {
+        c("Divergence", "Chain")
+    } else {
+        "Chain"
+    }
+
     ui <- shiny::fluidPage(
         shiny::titlePanel("Interactive posterior density surface"),
         shiny::sidebarLayout(
             shiny::sidebarPanel(
                 parameterInput("surface_x", "X parameter"),
                 parameterInput("surface_y", "Y parameter"),
+                shiny::radioButtons(
+                    "surface_colour",
+                    "Colour scatter points by",
+                    choices = colour_choices,
+                    selected = colour_choices[1L]
+                ),
+                shiny::radioButtons(
+                    "surface_display_mode",
+                    "Display",
+                    choices = c("Surface", "Scatter", "Both"),
+                    selected = "Surface"
+                ),
                 shiny::sliderInput(
                     "surface_grid",
                     "Density grid resolution",
@@ -1498,11 +1535,27 @@ launch_density_surface_3d <- function(
                     value = 0.85,
                     step = 0.05
                 ),
+                shiny::sliderInput(
+                    "surface_point_opacity",
+                    "Point opacity",
+                    min = 0.05,
+                    max = 1,
+                    value = 0.6,
+                    step = 0.05
+                ),
+                shiny::sliderInput(
+                    "surface_point_size",
+                    "Point size",
+                    min = 1,
+                    max = 8,
+                    value = 2,
+                    step = 1
+                ),
                 shiny::helpText(
                     paste0(
-                        posterior::ndraws(draws),
+                        number_of_draws,
                         " draws in ",
-                        posterior::nchains(draws),
+                        number_of_chains,
                         " chains. Height is estimated joint density."
                     )
                 )
@@ -1537,19 +1590,57 @@ launch_density_surface_3d <- function(
         selected_draws <- shiny::reactive({
             shiny::req(input$surface_x, input$surface_y)
             selected_variables <- unique(c(input$surface_x, input$surface_y))
-            plot_data <- posterior::subset_draws(
-                draws,
-                variable = selected_variables
-            ) |>
-                posterior::as_draws_df() |>
-                as.data.frame()
+            if (is_stanfit) {
+                raw_draws <- rstan::extract(
+                    draws,
+                    pars = selected_variables,
+                    permuted = FALSE,
+                    inc_warmup = FALSE
+                )
+                plot_data <- posterior::as_draws_array(raw_draws) |>
+                    posterior::as_draws_df() |>
+                    as.data.frame()
+                plot_data <- merge(
+                    plot_data,
+                    diagnostics[, c(".chain", ".iteration", "divergent__")],
+                    by = c(".chain", ".iteration"),
+                    all.x = TRUE,
+                    sort = FALSE
+                )
+            } else {
+                if (has_divergences) {
+                    selected_variables <- c(selected_variables, "divergent__")
+                }
+                plot_data <- posterior::subset_draws(
+                    draws,
+                    variable = unique(selected_variables)
+                ) |>
+                    posterior::as_draws_df() |>
+                    as.data.frame()
+            }
 
             if (is.finite(max_points) && nrow(plot_data) > max_points) {
-                plot_data <- plot_data[
-                    sample.int(nrow(plot_data), max_points),
-                    ,
-                    drop = FALSE
-                ]
+                if (has_divergences) {
+                    divergent_indices <- which(plot_data$divergent__ == 1)
+                    if (length(divergent_indices) >= max_points) {
+                        keep <- sample(divergent_indices, max_points)
+                    } else {
+                        regular_indices <- setdiff(
+                            seq_len(nrow(plot_data)),
+                            divergent_indices
+                        )
+                        keep <- c(
+                            divergent_indices,
+                            sample(
+                                regular_indices,
+                                max_points - length(divergent_indices)
+                            )
+                        )
+                    }
+                } else {
+                    keep <- sample.int(nrow(plot_data), max_points)
+                }
+                plot_data <- plot_data[sort(keep), , drop = FALSE]
             }
             plot_data
         })
@@ -1558,48 +1649,111 @@ launch_density_surface_3d <- function(
 
         output$density_surface_plot <- plotly::renderPlotly({
             plot_data <- selected_draws()
-            density <- get_cached_2d_density_surface(
-                density_cache,
-                paste(input$surface_x, input$surface_y, input$surface_grid, sep = "|"),
-                plot_data,
-                input$surface_x,
-                input$surface_y,
-                input$surface_grid
-            )
-            shiny::validate(
-                shiny::need(
-                    !inherits(density, "error"),
-                    paste("Density surface unavailable:", density$message)
-                )
-            )
+            show_surface <- input$surface_display_mode %in% c("Surface", "Both")
+            show_scatter <- input$surface_display_mode %in% c("Scatter", "Both")
+            plot <- plotly::plot_ly()
 
-            plotly::plot_ly(
-                x = density$x,
-                y = density$y,
-                z = t(density$z),
-                type = "surface",
-                opacity = input$surface_opacity,
-                colorscale = list(
-                    list(0, "#DBEAFE"),
-                    list(1, "#1D4ED8")
-                ),
-                contours = list(
-                    z = list(
-                        show = TRUE,
-                        usecolormap = TRUE,
-                        highlightcolor = "#111827",
-                        project = list(z = TRUE)
+            if (show_surface) {
+                density <- get_cached_2d_density_surface(
+                    density_cache,
+                    paste(input$surface_x, input$surface_y, input$surface_grid, sep = "|"),
+                    plot_data,
+                    input$surface_x,
+                    input$surface_y,
+                    input$surface_grid
+                )
+                shiny::validate(
+                    shiny::need(
+                        !inherits(density, "error"),
+                        paste("Density surface unavailable:", density$message)
                     )
-                ),
-                showscale = TRUE,
-                colorbar = list(title = "Density")
-            ) |>
+                )
+
+                plot <- plot |>
+                    plotly::add_trace(
+                        x = density$x,
+                        y = density$y,
+                        z = t(density$z),
+                        type = "surface",
+                        name = "Density surface",
+                        opacity = input$surface_opacity,
+                        colorscale = list(
+                            list(0, "#DBEAFE"),
+                            list(1, "#1D4ED8")
+                        ),
+                        contours = list(
+                            z = list(
+                                show = TRUE,
+                                usecolormap = TRUE,
+                                highlightcolor = "#111827",
+                                project = list(z = TRUE)
+                            )
+                        ),
+                        showscale = TRUE,
+                        colorbar = list(title = "Density")
+                    )
+            }
+
+            if (show_scatter) {
+                colour_variable <- if (
+                    has_divergences &&
+                        identical(input$surface_colour, "Divergence")
+                ) {
+                    factor(
+                        plot_data$divergent__,
+                        levels = c(0, 1),
+                        labels = c("Regular", "Divergent")
+                    )
+                } else {
+                    factor(plot_data$.chain)
+                }
+
+                plot <- plot |>
+                    plotly::add_trace(
+                        x = plot_data[[input$surface_x]],
+                        y = plot_data[[input$surface_y]],
+                        z = rep(0, nrow(plot_data)),
+                        color = colour_variable,
+                        type = "scatter3d",
+                        mode = "markers",
+                        marker = list(
+                            size = input$surface_point_size,
+                            opacity = input$surface_point_opacity
+                        ),
+                        hoverinfo = "text",
+                        text = paste0(
+                            input$surface_x,
+                            ": ",
+                            signif(plot_data[[input$surface_x]], 4),
+                            "<br>",
+                            input$surface_y,
+                            ": ",
+                            signif(plot_data[[input$surface_y]], 4),
+                            if (has_divergences) {
+                                paste0("<br>Divergence: ", plot_data$divergent__)
+                            } else {
+                                ""
+                            },
+                            "<br>Chain: ",
+                            plot_data$.chain,
+                            "<br>Iteration: ",
+                            plot_data$.iteration
+                        )
+                    )
+            }
+
+            plot |>
                 plotly::layout(
                     scene = list(
                         xaxis = list(title = input$surface_x),
                         yaxis = list(title = input$surface_y),
-                        zaxis = list(title = "Estimated density")
-                    )
+                        zaxis = list(title = if (show_surface) {
+                            "Estimated density"
+                        } else {
+                            ""
+                        })
+                    ),
+                    legend = list(title = list(text = input$surface_colour))
                 )
         })
     }
