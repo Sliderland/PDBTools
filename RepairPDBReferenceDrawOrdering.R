@@ -322,7 +322,14 @@ audit_summaries <- function(pdb_path, posterior_name = NULL) {
       }
     )
     data.frame(
-      file = path,
+      # Keep reports portable by omitting the machine-specific source path.
+      file = substring(
+        path,
+        nchar(normalizePath(
+          file.path(pdb_path, "posterior_database"),
+          mustWork = TRUE
+        )) + 2L
+      ),
       status = result$status,
       variables = result$variables,
       stringsAsFactors = FALSE
