@@ -1115,6 +1115,143 @@ PDBEntryBuilder <- R6::R6Class(
 
       invisible(model_dims)
     },
+    generate_model_unconstrained_parameter_counts_from_fit = function(
+      fit,
+      include = NULL,
+      exclude = NULL
+    ) {
+      always_exclude <- "lp__"
+
+      if (inherits(fit, "stanfit")) {
+        stan_fit_instance <- fit@.MISC$stan_fit_instance
+        if (is.null(stan_fit_instance)) {
+          stop(
+            "The `stanfit` object does not contain a valid compiled model instance.",
+            call. = FALSE
+          )
+        }
+        unconstrained_names <- stan_fit_instance$unconstrained_param_names(
+          TRUE,
+          TRUE
+        )
+        expected_count <- rstan::get_num_upars(fit)
+        if (length(unconstrained_names) != expected_count) {
+          stop(
+            "RStan returned a number of unconstrained parameter names that does not match `get_num_upars(fit)`.",
+            call. = FALSE
+          )
+        }
+      } else if (inherits(fit, "CmdStanMCMC")) {
+        unconstrained_draws <- fit$unconstrain_draws()
+        unconstrained_names <- posterior::variables(unconstrained_draws)
+      } else {
+        stop(
+          "`fit` must be an `rstan::stanfit` or `cmdstanr::CmdStanMCMC` object.",
+          call. = FALSE
+        )
+      }
+
+      if (!length(unconstrained_names)) {
+        stop(
+          "No unconstrained parameter names were returned for this fit.",
+          call. = FALSE
+        )
+      }
+
+      # Stan and its interfaces encode indexed unconstrained coordinates with
+      # bracket or dot notation. Group those coordinates by their base name.
+      base_names <- sub("\\[.*$", "", unconstrained_names)
+      base_names <- sub("\\.[0-9].*$", "", base_names)
+      model_counts <- as.list(table(base_names))
+      model_counts <- lapply(model_counts, as.integer)
+      available <- names(model_counts)
+
+      if (!is.null(include)) {
+        missing_include <- setdiff(include, available)
+        if (length(missing_include)) {
+          stop(
+            "Variables requested for inclusion were not found among unconstrained parameters: ",
+            paste(missing_include, collapse = ", "),
+            call. = FALSE
+          )
+        }
+        selected <- include
+      } else {
+        selected <- available
+      }
+      if (!is.null(exclude)) {
+        missing_exclude <- setdiff(exclude, c(available, always_exclude))
+        if (length(missing_exclude)) {
+          stop(
+            "Variables requested for exclusion were not found among unconstrained parameters: ",
+            paste(missing_exclude, collapse = ", "),
+            call. = FALSE
+          )
+        }
+      }
+      selected <- setdiff(selected, c(exclude, always_exclude))
+      if (!length(selected)) {
+        stop("Parameter selection produced no unconstrained parameters.", call. = FALSE)
+      }
+
+      model_counts[selected]
+    },
+    generate_model_unconstrained_parameter_counts = function(
+      model_code,
+      data = self$data,
+      include = NULL,
+      exclude = NULL,
+      backend = self$stan_backend
+    ) {
+      if (is.null(data) || !is.list(data)) {
+        stop(
+          "`data` must be a named list or `pdb_data` object.",
+          call. = FALSE
+        )
+      }
+      model_source <- as.character(model_code)
+      if (
+        length(model_source) != 1L || is.na(model_source) ||
+          !nzchar(model_source)
+      ) {
+        stop(
+          "`model_code` must be Stan source code or a path to a Stan file.",
+          call. = FALSE
+        )
+      }
+      if (file.exists(model_source)) {
+        model_source <- paste(readLines(model_source, warn = FALSE), collapse = "\n")
+      }
+      backend <- match.arg(backend, c("rstan", "cmdstanr"))
+
+      if (identical(backend, "rstan")) {
+        fit <- suppressWarnings(rstan::stan(
+          model_code = model_source,
+          data = data,
+          chains = 0,
+          refresh = 0
+        ))
+      } else {
+        model <- cmdstanr::cmdstan_model(
+          cmdstanr::write_stan_file(model_source),
+          compile = TRUE,
+          quiet = TRUE
+        )
+        fit <- suppressWarnings(model$sample(
+          data = data,
+          chains = 1,
+          iter_sampling = 1,
+          iter_warmup = 1,
+          refresh = 0
+        ))
+      }
+
+      self$generate_model_unconstrained_parameter_counts_from_fit(
+        fit,
+        include = include,
+        exclude = exclude
+      )
+    },
     create_model_code = function(stan_file, info) {
       if (!inherits(info, "pdb_model_info")) {
         if (!is.list(info)) {
